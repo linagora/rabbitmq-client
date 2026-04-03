@@ -1,0 +1,114 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  typecheck:
+    name: Type Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run type check
+        run: npm run typecheck
+
+  test:
+    name: Test (Node ${{ matrix.node-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [18, 20, 22]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm test
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build package
+        run: npm run build
+
+      - name: Check build output
+        run: |
+          for f in dist/index.js dist/index.cjs dist/index.d.ts \
+                   dist/testing/index.js dist/testing/index.cjs dist/testing/index.d.ts; do
+            if [ ! -f "$f" ]; then
+              echo "Error: $f not found"
+              exit 1
+            fi
+          done
+          echo "Build outputs verified"
+
+  status-check:
+    name: Status Check
+    runs-on: ubuntu-latest
+    if: always()
+    needs: [typecheck, test, build]
+    steps:
+      - name: Check all jobs status
+        run: |
+          if [ "${{ needs.typecheck.result }}" != "success" ]; then
+            echo "Type check job failed"
+            exit 1
+          fi
+          if [ "${{ needs.test.result }}" != "success" ]; then
+            echo "Test job failed"
+            exit 1
+          fi
+          if [ "${{ needs.build.result }}" != "success" ]; then
+            echo "Build job failed"
+            exit 1
+          fi
+          echo "All jobs passed successfully"
