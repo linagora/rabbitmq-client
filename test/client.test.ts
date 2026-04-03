@@ -356,4 +356,23 @@ describe('RabbitMQClient', () => {
       expect(mockChannel.nack).toHaveBeenCalledWith(msg, false, false)
     })
   })
+
+  describe('checkHealth()', () => {
+    it('should return false when not connected', async () => {
+      expect(await client.checkHealth()).toBe(false)
+    })
+
+    it('should return true when connection is healthy', async () => {
+      await client.init()
+      expect(await client.checkHealth()).toBe(true)
+      expect(mockChannel.assertQueue).toHaveBeenCalled()
+      expect(mockChannel.deleteQueue).toHaveBeenCalled()
+    })
+
+    it('should return false when queue operation fails', async () => {
+      await client.init()
+      mockChannel.assertQueue.mockRejectedValueOnce(new Error('queue op failed'))
+      expect(await client.checkHealth()).toBe(false)
+    })
+  })
 })

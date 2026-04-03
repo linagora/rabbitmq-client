@@ -403,6 +403,23 @@ export class RabbitMQClient {
     this.channel.nack(message, false, false)
   }
 
+  async checkHealth(): Promise<boolean> {
+    if (!this.connected || !this.channel) {
+      return false
+    }
+    try {
+      const { queue } = await this.channel.assertQueue('', {
+        exclusive: true,
+        autoDelete: true,
+      })
+      await this.channel.deleteQueue(queue)
+      return true
+    } catch (error) {
+      this.logger.warn({ error }, 'Health check failed')
+      return false
+    }
+  }
+
   private sleep(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms))
   }
