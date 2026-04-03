@@ -293,4 +293,67 @@ describe('RabbitMQClient', () => {
       expect(mockChannel.consume).toHaveBeenCalledTimes(2)
     })
   })
+
+  describe('handleWithRetry()', () => {
+    let consumeCallback: ((msg: unknown) => void) | null
+
+    beforeEach(async () => {
+      consumeCallback = null
+      mockChannel.consume.mockImplementation(((_queue: string, cb: (msg: unknown) => void) => {
+        consumeCallback = cb
+        return Promise.resolve({ consumerTag: 'test' })
+      }) as typeof mockChannel.consume)
+      await client.init()
+    })
+
+    const createMessage = (content: unknown) => ({
+      content: Buffer.from(typeof content === 'string' ? content : JSON.stringify(content)),
+      fields: { deliveryTag: 1, redelivered: false, exchange: 'ex', routingKey: 'key', consumerTag: 'test' },
+      properties: { headers: {} },
+    })
+
+    it('should ack on successful processing', async () => {
+      const handler = vi.fn().mockResolvedValue(undefined)
+      await client.subscribe('ex', 'key', 'queue', handler)
+      const msg = createMessage({ foo: 'bar' })
+      consumeCallback!(msg)
+      await vi.advanceTimersByTimeAsync(50)
+      expect(handler).toHaveBeenCalledWith({ foo: 'bar' })
+      expect(mockChannel.ack).toHaveBeenCalledWith(msg)
+    })
+
+    it('should nack invalid JSON immediately to DLQ', async () => {
+      const handler = vi.fn().mockResolvedValue(undefined)
+      await client.subscribe('ex', 'key', 'queue', handler)
+      const msg = createMessage('not valid json {')
+      consumeCallback!(msg)
+      await vi.advanceTimersByTimeAsync(50)
+      expect(handler).not.toHaveBeenCalled()
+      expect(mockChannel.nack).toHaveBeenCalledWith(msg, false, false)
+    })
+
+    it('should retry on handler failure and ack on eventual success', async () => {
+      const handler = vi.fn()
+        .mockRejectedValueOnce(new Error('fail'))
+        .mockResolvedValueOnce(undefined)
+      await client.subscribe('ex', 'key', 'queue', handler)
+      const msg = createMessage({ foo: 'bar' })
+      consumeCallback!(msg)
+      await vi.advanceTimersByTimeAsync(200)
+      expect(handler).toHaveBeenCalledTimes(2)
+      expect(mockChannel.ack).toHaveBeenCalledWith(msg)
+      expect(mockChannel.nack).not.toHaveBeenCalled()
+    })
+
+    it('should nack to DLQ after exhausting maxRetries', async () => {
+      const handler = vi.fn().mockRejectedValue(new Error('always fails'))
+      await client.subscribe('ex', 'key', 'queue', handler)
+      const msg = createMessage({ foo: 'bar' })
+      consumeCallback!(msg)
+      await vi.advanceTimersByTimeAsync(500)
+      expect(handler).toHaveBeenCalledTimes(3) // maxRetries = 3
+      expect(mockChannel.ack).not.toHaveBeenCalled()
+      expect(mockChannel.nack).toHaveBeenCalledWith(msg, false, false)
+    })
+  })
 })

@@ -333,11 +333,75 @@ export class RabbitMQClient {
     this.logger.info({ exchange, routingKey, queue }, 'Subscribed to queue')
   }
 
-  // Placeholder -- implemented in Task 6
   private async handleWithRetry(
-    _message: amqp.ConsumeMessage,
-    _handler: RabbitMQMessageHandler,
-  ): Promise<void> {}
+    message: amqp.ConsumeMessage,
+    handler: RabbitMQMessageHandler,
+  ): Promise<void> {
+    if (!this.channel) {
+      this.logger.warn('Cannot process message -- channel unavailable')
+      return
+    }
+    const startTime = Date.now()
+    let attempts = 0
+    const routingKey = message.fields.routingKey
+    const exchange = message.fields.exchange
+
+    let content: RabbitMQMessage
+    try {
+      content = JSON.parse(message.content.toString())
+    } catch (parseError) {
+      const rawPreview = message.content.toString().substring(0, 100)
+      this.logger.error(
+        {
+          error: parseError,
+          exchange,
+          routingKey,
+          rawContentPreview: rawPreview + (rawPreview.length >= 100 ? '...' : ''),
+        },
+        'Failed to parse message JSON, sending to DLQ',
+      )
+      this.channel.nack(message, false, false)
+      return
+    }
+
+    this.logger.debug({ exchange, routingKey, payload: content }, 'Message received, processing')
+
+    while (attempts < this.options.maxRetries) {
+      try {
+        await handler(content)
+        const duration = Date.now() - startTime
+        this.logger.info(
+          { exchange, routingKey, duration, attempts: attempts + 1 },
+          'Message processed successfully',
+        )
+        this.channel.ack(message)
+        return
+      } catch (error) {
+        attempts++
+        this.logger.error(
+          {
+            error: error instanceof Error ? error.message : error,
+            stack: error instanceof Error ? error.stack : undefined,
+            exchange,
+            routingKey,
+            attempt: attempts,
+            maxRetries: this.options.maxRetries,
+          },
+          'Handler failed',
+        )
+        if (attempts < this.options.maxRetries) {
+          await this.sleep(this.options.retryDelay)
+        }
+      }
+    }
+
+    const duration = Date.now() - startTime
+    this.logger.error(
+      { exchange, routingKey, maxRetries: this.options.maxRetries, duration },
+      'Message failed after max retries, sending to DLQ',
+    )
+    this.channel.nack(message, false, false)
+  }
 
   private sleep(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms))
