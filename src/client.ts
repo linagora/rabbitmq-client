@@ -1,20 +1,18 @@
 import amqp from 'amqplib'
 import type {
   RabbitMQClientOptions,
+  RabbitMQHooks,
   RabbitMQMessage,
   RabbitMQMessageHandler,
   RabbitMQSubscription,
+  SubscribeOptions,
 } from './types.js'
 import { createLogger } from './logger.js'
 import type { Logger } from 'pino'
 
-/** Default prefetch count for message consumption */
 const DEFAULT_PREFETCH = 10
-
-/** Maximum backoff delay for publish retries (60 seconds) */
 const MAX_PUBLISH_RETRY_DELAY_MS = 60_000
 
-/** Default values for optional config */
 const DEFAULTS = {
   maxRetries: 3,
   retryDelay: 1000,
@@ -22,17 +20,36 @@ const DEFAULTS = {
   initMaxAttempts: 5,
   publishMaxAttempts: 5,
   prefetch: DEFAULT_PREFETCH,
+  closeTimeout: 5000,
 } as const
 
+/**
+ * Production-grade RabbitMQ client with confirm channels, automatic DLQ
+ * infrastructure, reconnection with subscription restoration, and
+ * exponential-backoff publishing.
+ *
+ * @example
+ * ```ts
+ * const client = new RabbitMQClient({ url: 'amqp://localhost' })
+ * await client.init()
+ * await client.publish('events', 'user.created', { userId: '123' })
+ * await client.subscribe('events', 'user.created', 'user-service', handler)
+ * ```
+ */
 export class RabbitMQClient {
   private connection: amqp.ChannelModel | null = null
   private channel: amqp.ConfirmChannel | null = null
   private connected = false
   private subscriptions: RabbitMQSubscription[] = []
-  private readonly options: Required<Omit<RabbitMQClientOptions, 'logger'>>
+  private readonly options: Required<Omit<RabbitMQClientOptions, 'logger' | 'hooks'>>
   private readonly logger: Logger
+  private readonly hooks: RabbitMQHooks
   private initializationPromise: Promise<void> | null = null
   private reconnectionPromise: Promise<void> | null = null
+  private assertedExchanges = new Set<string>()
+  private consumerTags = new Map<string, string>()
+  private inflightCount = 0
+  private drainResolve: (() => void) | null = null
 
   constructor(options: RabbitMQClientOptions) {
     this.options = {
@@ -43,10 +60,17 @@ export class RabbitMQClient {
       initMaxAttempts: options.initMaxAttempts ?? DEFAULTS.initMaxAttempts,
       publishMaxAttempts: options.publishMaxAttempts ?? DEFAULTS.publishMaxAttempts,
       prefetch: options.prefetch ?? DEFAULTS.prefetch,
+      closeTimeout: options.closeTimeout ?? DEFAULTS.closeTimeout,
     }
     this.logger = createLogger(options.logger)
+    this.hooks = options.hooks ?? {}
   }
 
+  /**
+   * Opens a connection and creates a confirm channel. Retries up to
+   * `initMaxAttempts` times, then throws. Idempotent and safe to call
+   * concurrently — duplicate calls share the same in-flight promise.
+   */
   async init(): Promise<void> {
     if (this.connection && this.connected) {
       return
@@ -66,6 +90,8 @@ export class RabbitMQClient {
   }
 
   private async doConnect(maxAttempts?: number): Promise<void> {
+    this.assertedExchanges.clear()
+    this.consumerTags.clear()
     let attempts = 0
     while (!this.connected) {
       try {
@@ -134,6 +160,11 @@ export class RabbitMQClient {
     return this.connected
   }
 
+  /**
+   * Publishes a JSON message to a topic exchange with publisher confirms.
+   * Retries with exponential backoff (capped at 60 s), forcing a reconnect
+   * on each failure. Throws after `publishMaxAttempts` exhausted.
+   */
   async publish(
     exchange: string,
     routingKey: string,
@@ -155,7 +186,10 @@ export class RabbitMQClient {
           throw new Error('Channel not available')
         }
 
-        await this.channel.assertExchange(exchange, 'topic', { durable: true })
+        if (!this.assertedExchanges.has(exchange)) {
+          await this.channel.assertExchange(exchange, 'topic', { durable: true })
+          this.assertedExchanges.add(exchange)
+        }
 
         this.channel.publish(exchange, routingKey, content, {
           persistent: true,
@@ -170,18 +204,16 @@ export class RabbitMQClient {
         }
         this.logger.debug({ exchange, routingKey, payload: message }, 'Published message payload')
 
+        this.callHook(this.hooks.onPublish, { exchange, routingKey, attempts: attempts + 1 })
+
         return
       } catch (error) {
         attempts++
         this.connected = false
 
-        const serializedError = error instanceof Error
-          ? { message: error.message, name: error.name, stack: error.stack }
-          : error
-
         if (attempts >= maxAttempts) {
           this.logger.error(
-            { error: serializedError, exchange, routingKey, attempts, maxAttempts },
+            { error, exchange, routingKey, attempts, maxAttempts },
             'Publish failed after max attempts',
           )
           throw new Error(
@@ -195,7 +227,7 @@ export class RabbitMQClient {
         )
 
         this.logger.warn(
-          { error: serializedError, exchange, routingKey, attempt: attempts, maxAttempts, retryDelayMs: retryDelay },
+          { error, exchange, routingKey, attempt: attempts, maxAttempts, retryDelayMs: retryDelay },
           'Publish attempt failed, retrying',
         )
 
@@ -204,8 +236,18 @@ export class RabbitMQClient {
     }
   }
 
+  /**
+   * Gracefully shuts down the client. Waits up to `closeTimeout` ms for
+   * in-flight message handlers to finish before closing the channel and
+   * connection. Pass `false` to preserve subscriptions for a later
+   * `init()` / reconnect cycle.
+   */
   async close(clearSubscriptions = true): Promise<void> {
     try {
+      if (this.inflightCount > 0) {
+        this.logger.info({ inflightCount: this.inflightCount }, 'Waiting for in-flight messages to drain')
+        await this.waitForDrain(this.options.closeTimeout)
+      }
       await this.channel?.close()
       await this.connection?.close()
       this.connection = null
@@ -213,6 +255,8 @@ export class RabbitMQClient {
       this.connected = false
       this.initializationPromise = null
       this.reconnectionPromise = null
+      this.assertedExchanges.clear()
+      this.consumerTags.clear()
       if (clearSubscriptions) {
         this.subscriptions = []
       }
@@ -248,19 +292,20 @@ export class RabbitMQClient {
       return
     }
     this.logger.info({ count: this.subscriptions.length }, 'Re-establishing subscriptions')
+    const subs = [...this.subscriptions]
     const results = await Promise.allSettled(
-      this.subscriptions.map(async ({ exchange, routingKey, queue, handler }) => {
-        await this.setupSubscription(exchange, routingKey, queue, handler)
-        return queue
+      subs.map(async (sub) => {
+        await this.setupSubscription(sub)
+        return sub.queue
       }),
     )
     const succeeded: string[] = []
     const failed: string[] = []
     results.forEach((result, index) => {
-      const queue = this.subscriptions[index].queue
       if (result.status === 'fulfilled') {
-        succeeded.push(queue)
+        succeeded.push(result.value)
       } else {
+        const queue = subs[index].queue
         failed.push(queue)
         this.logger.error({ error: result.reason, queue }, 'Failed to re-subscribe to queue')
       }
@@ -271,35 +316,53 @@ export class RabbitMQClient {
     if (failed.length > 0) {
       this.logger.warn({ count: failed.length, queues: failed }, 'Some subscriptions failed to restore')
     }
+    this.callHook(this.hooks.onReconnect, { subscriptionsRestored: succeeded.length, subscriptionsFailed: failed.length })
   }
 
+  /**
+   * Subscribes to a queue with automatic DLQ infrastructure setup.
+   *
+   * Pass `options.queueArguments` to override the default quorum-queue
+   * arguments (merged with the DLQ wiring defaults).
+   */
   async subscribe(
     exchange: string,
     routingKey: string,
     queue: string,
     handler: RabbitMQMessageHandler,
+    options?: SubscribeOptions,
   ): Promise<void> {
-    const existingIndex = this.subscriptions.findIndex((s) => s.queue === queue)
-    if (existingIndex === -1) {
-      this.subscriptions.push({ exchange, routingKey, queue, handler })
-    } else {
-      this.subscriptions[existingIndex] = { exchange, routingKey, queue, handler }
-    }
     if (!this.connected || !this.channel) {
       throw new Error('RabbitMQ client not connected. Call init() first.')
     }
-    await this.setupSubscription(exchange, routingKey, queue, handler)
+    const sub: RabbitMQSubscription = { exchange, routingKey, queue, handler, options }
+    const existingIndex = this.subscriptions.findIndex((s) => s.queue === queue)
+    if (existingIndex === -1) {
+      this.subscriptions.push(sub)
+    } else {
+      this.subscriptions[existingIndex] = sub
+    }
+    await this.setupSubscription(sub)
   }
 
-  private async setupSubscription(
-    exchange: string,
-    routingKey: string,
-    queue: string,
-    handler: RabbitMQMessageHandler,
-  ): Promise<void> {
+  /**
+   * Cancels a queue subscription and removes it from the restoration list.
+   */
+  async unsubscribe(queue: string): Promise<void> {
+    const tag = this.consumerTags.get(queue)
+    if (tag && this.channel) {
+      await this.channel.cancel(tag)
+    }
+    this.consumerTags.delete(queue)
+    this.subscriptions = this.subscriptions.filter((s) => s.queue !== queue)
+    this.logger.info({ queue }, 'Unsubscribed from queue')
+  }
+
+  private async setupSubscription(sub: RabbitMQSubscription): Promise<void> {
     if (!this.channel) {
       throw new Error('Channel not available')
     }
+    const { exchange, routingKey, queue, handler, options } = sub
     const dlxExchange = `${exchange}.dlx`
     const dlqQueue = `${queue}.dlq`
     const dlqRoutingKey = `${routingKey}.dead`
@@ -307,7 +370,11 @@ export class RabbitMQClient {
     await this.channel.assertExchange(dlxExchange, 'topic', { durable: true })
     await this.channel.assertQueue(dlqQueue, { durable: true })
     await this.channel.bindQueue(dlqQueue, dlxExchange, dlqRoutingKey)
-    await this.channel.assertExchange(exchange, 'topic', { durable: true })
+
+    if (!this.assertedExchanges.has(exchange)) {
+      await this.channel.assertExchange(exchange, 'topic', { durable: true })
+      this.assertedExchanges.add(exchange)
+    }
 
     await this.channel.assertQueue(queue, {
       durable: true,
@@ -317,11 +384,12 @@ export class RabbitMQClient {
         'x-dead-letter-strategy': 'at-least-once',
         'x-queue-type': 'quorum',
         'x-overflow': 'reject-publish',
+        ...options?.queueArguments,
       },
     })
 
     await this.channel.bindQueue(queue, exchange, routingKey)
-    await this.channel.consume(
+    const { consumerTag } = await this.channel.consume(
       queue,
       (message) => {
         if (message) {
@@ -330,6 +398,7 @@ export class RabbitMQClient {
       },
       { noAck: false },
     )
+    this.consumerTags.set(queue, consumerTag)
     this.logger.info({ exchange, routingKey, queue }, 'Subscribed to queue')
   }
 
@@ -337,72 +406,91 @@ export class RabbitMQClient {
     message: amqp.ConsumeMessage,
     handler: RabbitMQMessageHandler,
   ): Promise<void> {
-    if (!this.channel) {
+    // Capture the channel reference so ack/nack always targets the channel
+    // that delivered this message, even if a reconnection swaps this.channel.
+    const channel = this.channel
+    if (!channel) {
       this.logger.warn('Cannot process message -- channel unavailable')
       return
     }
-    const startTime = Date.now()
-    let attempts = 0
-    const routingKey = message.fields.routingKey
-    const exchange = message.fields.exchange
-
-    let content: RabbitMQMessage
+    this.inflightCount++
     try {
-      content = JSON.parse(message.content.toString())
-    } catch (parseError) {
-      const rawPreview = message.content.toString().substring(0, 100)
-      this.logger.error(
-        {
-          error: parseError,
-          exchange,
-          routingKey,
-          rawContentPreview: rawPreview + (rawPreview.length >= 100 ? '...' : ''),
-        },
-        'Failed to parse message JSON, sending to DLQ',
-      )
-      this.channel.nack(message, false, false)
-      return
-    }
+      const startTime = Date.now()
+      let attempts = 0
+      const routingKey = message.fields.routingKey
+      const exchange = message.fields.exchange
 
-    this.logger.debug({ exchange, routingKey, payload: content }, 'Message received, processing')
-
-    while (attempts < this.options.maxRetries) {
+      let content: RabbitMQMessage
       try {
-        await handler(content)
-        const duration = Date.now() - startTime
-        this.logger.info(
-          { exchange, routingKey, duration, attempts: attempts + 1 },
-          'Message processed successfully',
-        )
-        this.channel.ack(message)
-        return
-      } catch (error) {
-        attempts++
+        content = JSON.parse(message.content.toString())
+      } catch (parseError) {
+        const rawContent = message.content.toString()
+        const rawPreview = rawContent.substring(0, 100)
         this.logger.error(
           {
-            error: error instanceof Error ? error.message : error,
-            stack: error instanceof Error ? error.stack : undefined,
+            error: parseError,
             exchange,
             routingKey,
-            attempt: attempts,
-            maxRetries: this.options.maxRetries,
+            rawContentPreview: rawPreview + (rawContent.length > 100 ? '...' : ''),
           },
-          'Handler failed',
+          'Failed to parse message JSON, sending to DLQ',
         )
-        if (attempts < this.options.maxRetries) {
-          await this.sleep(this.options.retryDelay)
+        channel.nack(message, false, false)
+        this.callHook(this.hooks.onMessageDlq, { exchange, routingKey, duration: 0, reason: 'invalid_json' })
+        return
+      }
+
+      this.logger.debug({ exchange, routingKey, payload: content }, 'Message received, processing')
+
+      while (attempts < this.options.maxRetries) {
+        try {
+          await handler(content)
+          const duration = Date.now() - startTime
+          this.logger.info(
+            { exchange, routingKey, duration, attempts: attempts + 1 },
+            'Message processed successfully',
+          )
+          channel.ack(message)
+          this.callHook(this.hooks.onMessageProcessed, { exchange, routingKey, duration, attempts: attempts + 1 })
+          return
+        } catch (error) {
+          attempts++
+          this.logger.error(
+            {
+              error: error instanceof Error ? error.message : error,
+              stack: error instanceof Error ? error.stack : undefined,
+              exchange,
+              routingKey,
+              attempt: attempts,
+              maxRetries: this.options.maxRetries,
+            },
+            'Handler failed',
+          )
+          if (attempts < this.options.maxRetries) {
+            await this.sleep(this.options.retryDelay)
+          }
         }
       }
-    }
 
-    const duration = Date.now() - startTime
-    this.logger.error(
-      { exchange, routingKey, maxRetries: this.options.maxRetries, duration },
-      'Message failed after max retries, sending to DLQ',
-    )
-    this.channel.nack(message, false, false)
+      const duration = Date.now() - startTime
+      this.logger.error(
+        { exchange, routingKey, maxRetries: this.options.maxRetries, duration },
+        'Message failed after max retries, sending to DLQ',
+      )
+      channel.nack(message, false, false)
+      this.callHook(this.hooks.onMessageDlq, { exchange, routingKey, duration, reason: 'max_retries_exhausted' })
+    } finally {
+      this.inflightCount--
+      if (this.inflightCount === 0 && this.drainResolve) {
+        this.drainResolve()
+      }
+    }
   }
 
+  /**
+   * Lightweight liveness probe: creates and immediately deletes a temporary
+   * exclusive queue. Returns `false` when disconnected or on broker error.
+   */
   async checkHealth(): Promise<boolean> {
     if (!this.connected || !this.channel) {
       return false
@@ -418,6 +506,30 @@ export class RabbitMQClient {
       this.logger.warn({ error }, 'Health check failed')
       return false
     }
+  }
+
+  private waitForDrain(timeout: number): Promise<void> {
+    if (this.inflightCount === 0) return Promise.resolve()
+    return new Promise<void>((resolve) => {
+      const timer = setTimeout(() => {
+        this.logger.warn(
+          { inflightCount: this.inflightCount },
+          'Close timeout reached with messages still in flight',
+        )
+        this.drainResolve = null
+        resolve()
+      }, timeout)
+      this.drainResolve = () => {
+        clearTimeout(timer)
+        this.drainResolve = null
+        resolve()
+      }
+    })
+  }
+
+  /** Invokes a hook callback, swallowing errors so hooks never break message flow. */
+  private callHook<T>(hook: ((info: T) => void) | undefined, info: T): void {
+    try { hook?.(info) } catch { /* swallowed */ }
   }
 
   private sleep(ms: number): Promise<void> {

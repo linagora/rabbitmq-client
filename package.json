@@ -1,7 +1,7 @@
 {
   "name": "@linagora/rabbitmq-client",
-  "version": "0.1.0",
-  "description": "Production-grade RabbitMQ client with confirm channels, DLQ infrastructure, auto-reconnection, and exponential backoff",
+  "version": "0.2.0",
+  "description": "Production-grade RabbitMQ client with confirm channels, DLQ infrastructure, auto-reconnection, exponential backoff, graceful shutdown, and observability hooks",
   "type": "module",
   "exports": {
     ".": {

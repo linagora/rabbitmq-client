@@ -66,6 +66,7 @@ export class MockRabbitMQChannel extends EventEmitter {
   readonly waitForConfirms = mockFn().mockResolvedValue(undefined)
   readonly prefetch = mockFn().mockResolvedValue(undefined)
   readonly deleteQueue = mockFn().mockResolvedValue({})
+  readonly cancel = mockFn().mockResolvedValue(undefined)
 
   /**
    * Tracks all published messages and stores them for later inspection.
@@ -81,13 +82,16 @@ export class MockRabbitMQChannel extends EventEmitter {
     return true
   }
 
+  private _consumerCounter = 0
+
   /**
    * Stores the consumer callback for use with simulateMessage.
+   * Returns a unique consumer tag per call.
    */
-  consume(queue: string, callback: (msg: unknown) => void): Promise<{ consumerTag: string }> {
-    void queue
+  consume(_queue: string, callback: (msg: unknown) => void): Promise<{ consumerTag: string }> {
     this._consumeCallback = callback
-    return Promise.resolve({ consumerTag: 'mock-consumer' })
+    const consumerTag = `mock-consumer-${++this._consumerCounter}`
+    return Promise.resolve({ consumerTag })
   }
 
   // ---------------------------------------------------------------------------
@@ -98,26 +102,23 @@ export class MockRabbitMQChannel extends EventEmitter {
    * Delivers a valid JSON message to the registered consume callback.
    */
   simulateMessage(content: unknown): void {
-    if (!this._consumeCallback) return
-    const msg = {
-      content: Buffer.from(JSON.stringify(content)),
-      fields: { deliveryTag: 1, redelivered: false, exchange: '', routingKey: '', consumerTag: 'mock-consumer' },
-      properties: { headers: {} },
-    }
-    this._consumeCallback(msg)
+    this._deliver(Buffer.from(JSON.stringify(content)))
   }
 
   /**
    * Delivers a message with content that is not valid JSON.
    */
   simulateInvalidJsonMessage(): void {
+    this._deliver(Buffer.from('not valid json {'))
+  }
+
+  private _deliver(content: Buffer): void {
     if (!this._consumeCallback) return
-    const msg = {
-      content: Buffer.from('not valid json {'),
+    this._consumeCallback({
+      content,
       fields: { deliveryTag: 1, redelivered: false, exchange: '', routingKey: '', consumerTag: 'mock-consumer' },
       properties: { headers: {} },
-    }
-    this._consumeCallback(msg)
+    })
   }
 
   /** Emits a close event and marks the channel as closed. */
@@ -147,6 +148,7 @@ export class MockRabbitMQChannel extends EventEmitter {
   reset(): void {
     this._publishedMessages = []
     this._consumeCallback = null
+    this._consumerCounter = 0
     this.isClosed = false
     this.removeAllListeners()
   }
