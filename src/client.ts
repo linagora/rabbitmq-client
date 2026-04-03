@@ -157,6 +157,7 @@ export class RabbitMQClient {
     this.connected = false
     this.logger.info('Starting reconnection...')
     this.reconnectionPromise = this.doReconnect()
+    this.reconnectionPromise.catch(() => undefined)
     try {
       await this.reconnectionPromise
     } finally {
