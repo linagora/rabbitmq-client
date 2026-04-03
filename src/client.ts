@@ -1,5 +1,6 @@
 import amqp from 'amqplib'
 import type {
+  PublishOptions,
   RabbitMQClientOptions,
   RabbitMQHooks,
   RabbitMQMessage,
@@ -169,7 +170,7 @@ export class RabbitMQClient {
     exchange: string,
     routingKey: string,
     message: RabbitMQMessage,
-    options?: { maxAttempts?: number },
+    options?: PublishOptions,
   ): Promise<void> {
     let attempts = 0
     const maxAttempts = options?.maxAttempts ?? this.options.publishMaxAttempts
@@ -193,6 +194,10 @@ export class RabbitMQClient {
 
         this.channel.publish(exchange, routingKey, content, {
           persistent: true,
+          headers: options?.headers,
+          correlationId: options?.correlationId,
+          messageId: options?.messageId,
+          expiration: options?.expiration,
         })
 
         await this.channel.waitForConfirms()
@@ -376,16 +381,21 @@ export class RabbitMQClient {
       this.assertedExchanges.add(exchange)
     }
 
+    const queueType = options?.queueArguments?.['x-queue-type'] ?? 'quorum'
+    const queueArgs: Record<string, unknown> = {
+      'x-queue-type': queueType,
+      'x-overflow': 'reject-publish',
+    }
+    // at-least-once DLQ strategy is only supported by quorum queues
+    if (queueType === 'quorum') {
+      queueArgs['x-dead-letter-strategy'] = 'at-least-once'
+    }
+
     await this.channel.assertQueue(queue, {
       durable: true,
       deadLetterExchange: dlxExchange,
       deadLetterRoutingKey: dlqRoutingKey,
-      arguments: {
-        'x-dead-letter-strategy': 'at-least-once',
-        'x-queue-type': 'quorum',
-        'x-overflow': 'reject-publish',
-        ...options?.queueArguments,
-      },
+      arguments: { ...queueArgs, ...options?.queueArguments },
     })
 
     await this.channel.bindQueue(queue, exchange, routingKey)
@@ -393,7 +403,9 @@ export class RabbitMQClient {
       queue,
       (message) => {
         if (message) {
-          this.handleWithRetry(message, handler)
+          this.handleWithRetry(message, handler).catch((error) => {
+            this.logger.error({ error }, 'Unhandled error in message handler')
+          })
         }
       },
       { noAck: false },
@@ -529,7 +541,7 @@ export class RabbitMQClient {
 
   /** Invokes a hook callback, swallowing errors so hooks never break message flow. */
   private callHook<T>(hook: ((info: T) => void) | undefined, info: T): void {
-    try { hook?.(info) } catch { /* swallowed */ }
+    try { hook?.(info) } catch (error) { this.logger.debug({ error }, 'Observability hook error') }
   }
 
   private sleep(ms: number): Promise<void> {

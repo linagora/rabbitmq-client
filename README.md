@@ -48,6 +48,17 @@ Only `url` is required. Everything else has defaults.
 
 Publishes go through a confirm channel, so you know the broker accepted the message. If something goes wrong, the client retries with exponential backoff and forces a new channel on each attempt to avoid retrying on a silently dead connection. Exchange assertions are cached per connection to avoid unnecessary AMQP round-trips on the hot path.
 
+You can pass headers, correlation IDs, and other AMQP properties:
+
+```typescript
+await client.publish('auth', 'user.created', { userId: '123' }, {
+  headers: { 'x-trace-id': traceId },
+  correlationId: requestId,
+  messageId: uuid(),
+  expiration: '60000', // TTL in ms
+})
+```
+
 ### Subscribing
 
 Each call to `subscribe` wires up the DLQ plumbing for you:
@@ -158,4 +169,4 @@ mockConnection.simulateClose()
 
 ## License
 
-AGPL-3.0
+MIT

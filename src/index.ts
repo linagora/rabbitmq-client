@@ -1,5 +1,6 @@
 export { RabbitMQClient } from './client.js'
 export type {
+  PublishOptions,
   RabbitMQClientOptions,
   RabbitMQHooks,
   RabbitMQMessage,

@@ -5,13 +5,13 @@ import type { Logger } from 'pino'
  * Use these to wire metrics, tracing, or custom logging.
  */
 export interface RabbitMQHooks {
-  /** Called after a message is successfully published */
+  /** Called after the broker confirms a published message */
   onPublish?: (info: { exchange: string; routingKey: string; attempts: number }) => void
-  /** Called after a message handler completes successfully */
+  /** Called after a message handler returns successfully (duration includes retries) */
   onMessageProcessed?: (info: { exchange: string; routingKey: string; duration: number; attempts: number }) => void
-  /** Called when a message is sent to the dead-letter queue */
+  /** Called when a message is nacked to the dead-letter queue */
   onMessageDlq?: (info: { exchange: string; routingKey: string; duration: number; reason: 'invalid_json' | 'max_retries_exhausted' }) => void
-  /** Called after a successful reconnection */
+  /** Called after reconnection completes and subscriptions are re-established */
   onReconnect?: (info: { subscriptionsRestored: number; subscriptionsFailed: number }) => void
 }
 
@@ -47,6 +47,22 @@ export interface RabbitMQClientOptions {
   closeTimeout?: number
   /** Observability hooks for metrics and monitoring */
   hooks?: RabbitMQHooks
+}
+
+/**
+ * Options for the `publish()` method.
+ */
+export interface PublishOptions {
+  /** Max publish attempts with backoff (overrides client default) */
+  maxAttempts?: number
+  /** Custom message headers for tracing and metadata */
+  headers?: Record<string, unknown>
+  /** Correlation ID for request-reply patterns */
+  correlationId?: string
+  /** Unique message identifier */
+  messageId?: string
+  /** Per-message TTL in milliseconds (as string per AMQP spec) */
+  expiration?: string
 }
 
 /** JSON-serializable message payload */

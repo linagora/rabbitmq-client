@@ -538,7 +538,6 @@ describe('RabbitMQClient', () => {
         deadLetterExchange: 'ex.dlx',
         deadLetterRoutingKey: 'key.dead',
         arguments: {
-          'x-dead-letter-strategy': 'at-least-once',
           'x-queue-type': 'classic',
           'x-overflow': 'reject-publish',
           'x-max-length': 1000,
