@@ -238,4 +238,59 @@ describe('RabbitMQClient', () => {
       expect(vi.mocked(amqp.connect)).toHaveBeenCalledTimes(2)
     })
   })
+
+  describe('subscribe()', () => {
+    beforeEach(async () => {
+      await client.init()
+    })
+
+    it('should set up DLQ infrastructure', async () => {
+      const handler = vi.fn().mockResolvedValue(undefined)
+      await client.subscribe('test-exchange', 'test.key', 'test-queue', handler)
+
+      expect(mockChannel.assertExchange).toHaveBeenCalledWith('test-exchange.dlx', 'topic', { durable: true })
+      expect(mockChannel.assertQueue).toHaveBeenCalledWith('test-queue.dlq', { durable: true })
+      expect(mockChannel.bindQueue).toHaveBeenCalledWith('test-queue.dlq', 'test-exchange.dlx', 'test.key.dead')
+    })
+
+    it('should create main queue with quorum type and DLQ config', async () => {
+      const handler = vi.fn().mockResolvedValue(undefined)
+      await client.subscribe('test-exchange', 'test.key', 'test-queue', handler)
+
+      expect(mockChannel.assertQueue).toHaveBeenCalledWith('test-queue', {
+        durable: true,
+        deadLetterExchange: 'test-exchange.dlx',
+        deadLetterRoutingKey: 'test.key.dead',
+        arguments: {
+          'x-dead-letter-strategy': 'at-least-once',
+          'x-queue-type': 'quorum',
+          'x-overflow': 'reject-publish',
+        },
+      })
+    })
+
+    it('should bind queue and start consuming with manual ack', async () => {
+      const handler = vi.fn().mockResolvedValue(undefined)
+      await client.subscribe('test-exchange', 'test.key', 'test-queue', handler)
+
+      expect(mockChannel.bindQueue).toHaveBeenCalledWith('test-queue', 'test-exchange', 'test.key')
+      expect(mockChannel.consume).toHaveBeenCalledOnce()
+      expect(mockChannel.consume.mock.calls[0][0]).toBe('test-queue')
+      expect(mockChannel.consume.mock.calls[0][2]).toEqual({ noAck: false })
+    })
+
+    it('should throw when not connected', async () => {
+      await client.close()
+      const handler = vi.fn().mockResolvedValue(undefined)
+      await expect(client.subscribe('ex', 'key', 'queue', handler)).rejects.toThrow('not connected')
+    })
+
+    it('should not duplicate subscriptions for the same queue', async () => {
+      const handler1 = vi.fn().mockResolvedValue(undefined)
+      const handler2 = vi.fn().mockResolvedValue(undefined)
+      await client.subscribe('ex', 'key', 'queue', handler1)
+      await client.subscribe('ex', 'key', 'queue', handler2)
+      expect(mockChannel.consume).toHaveBeenCalledTimes(2)
+    })
+  })
 })

@@ -273,13 +273,65 @@ export class RabbitMQClient {
     }
   }
 
-  // Placeholder -- implemented in Task 5
+  async subscribe(
+    exchange: string,
+    routingKey: string,
+    queue: string,
+    handler: RabbitMQMessageHandler,
+  ): Promise<void> {
+    const existingIndex = this.subscriptions.findIndex((s) => s.queue === queue)
+    if (existingIndex === -1) {
+      this.subscriptions.push({ exchange, routingKey, queue, handler })
+    } else {
+      this.subscriptions[existingIndex] = { exchange, routingKey, queue, handler }
+    }
+    if (!this.connected || !this.channel) {
+      throw new Error('RabbitMQ client not connected. Call init() first.')
+    }
+    await this.setupSubscription(exchange, routingKey, queue, handler)
+  }
+
   private async setupSubscription(
-    _exchange: string,
-    _routingKey: string,
-    _queue: string,
-    _handler: RabbitMQMessageHandler,
-  ): Promise<void> {}
+    exchange: string,
+    routingKey: string,
+    queue: string,
+    handler: RabbitMQMessageHandler,
+  ): Promise<void> {
+    if (!this.channel) {
+      throw new Error('Channel not available')
+    }
+    const dlxExchange = `${exchange}.dlx`
+    const dlqQueue = `${queue}.dlq`
+    const dlqRoutingKey = `${routingKey}.dead`
+
+    await this.channel.assertExchange(dlxExchange, 'topic', { durable: true })
+    await this.channel.assertQueue(dlqQueue, { durable: true })
+    await this.channel.bindQueue(dlqQueue, dlxExchange, dlqRoutingKey)
+    await this.channel.assertExchange(exchange, 'topic', { durable: true })
+
+    await this.channel.assertQueue(queue, {
+      durable: true,
+      deadLetterExchange: dlxExchange,
+      deadLetterRoutingKey: dlqRoutingKey,
+      arguments: {
+        'x-dead-letter-strategy': 'at-least-once',
+        'x-queue-type': 'quorum',
+        'x-overflow': 'reject-publish',
+      },
+    })
+
+    await this.channel.bindQueue(queue, exchange, routingKey)
+    await this.channel.consume(
+      queue,
+      (message) => {
+        if (message) {
+          this.handleWithRetry(message, handler)
+        }
+      },
+      { noAck: false },
+    )
+    this.logger.info({ exchange, routingKey, queue }, 'Subscribed to queue')
+  }
 
   // Placeholder -- implemented in Task 6
   private async handleWithRetry(
