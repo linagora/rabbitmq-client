@@ -11,6 +11,9 @@ import type { Logger } from 'pino'
 /** Default prefetch count for message consumption */
 const DEFAULT_PREFETCH = 10
 
+/** Maximum backoff delay for publish retries (60 seconds) */
+const MAX_PUBLISH_RETRY_DELAY_MS = 60_000
+
 /** Default values for optional config */
 const DEFAULTS = {
   maxRetries: 3,
@@ -129,6 +132,76 @@ export class RabbitMQClient {
    */
   isConnected(): boolean {
     return this.connected
+  }
+
+  async publish(
+    exchange: string,
+    routingKey: string,
+    message: RabbitMQMessage,
+    options?: { maxAttempts?: number },
+  ): Promise<void> {
+    let attempts = 0
+    const maxAttempts = options?.maxAttempts ?? this.options.publishMaxAttempts
+    const baseDelay = this.options.connectionRetryDelay
+    const content = Buffer.from(JSON.stringify(message))
+
+    while (attempts < maxAttempts) {
+      try {
+        if (!this.connected) {
+          await this.reconnectWithRetry()
+        }
+
+        if (!this.channel) {
+          throw new Error('Channel not available')
+        }
+
+        await this.channel.assertExchange(exchange, 'topic', { durable: true })
+
+        this.channel.publish(exchange, routingKey, content, {
+          persistent: true,
+        })
+
+        await this.channel.waitForConfirms()
+
+        if (attempts > 0) {
+          this.logger.info({ exchange, routingKey, messageSize: content.length, attempts }, 'Published message after retries')
+        } else {
+          this.logger.info({ exchange, routingKey, messageSize: content.length }, 'Published message')
+        }
+        this.logger.debug({ exchange, routingKey, payload: message }, 'Published message payload')
+
+        return
+      } catch (error) {
+        attempts++
+        this.connected = false
+
+        const serializedError = error instanceof Error
+          ? { message: error.message, name: error.name, stack: error.stack }
+          : error
+
+        if (attempts >= maxAttempts) {
+          this.logger.error(
+            { error: serializedError, exchange, routingKey, attempts, maxAttempts },
+            'Publish failed after max attempts',
+          )
+          throw new Error(
+            `Failed to publish to ${exchange}/${routingKey} after ${attempts} attempts: ${error instanceof Error ? error.message : String(error)}`,
+          )
+        }
+
+        const retryDelay = Math.min(
+          baseDelay * Math.pow(2, attempts - 1),
+          MAX_PUBLISH_RETRY_DELAY_MS,
+        )
+
+        this.logger.warn(
+          { error: serializedError, exchange, routingKey, attempt: attempts, maxAttempts, retryDelayMs: retryDelay },
+          'Publish attempt failed, retrying',
+        )
+
+        await this.sleep(retryDelay)
+      }
+    }
   }
 
   async close(clearSubscriptions = true): Promise<void> {

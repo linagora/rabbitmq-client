@@ -175,4 +175,67 @@ describe('RabbitMQClient', () => {
       expect(client.isConnected()).toBe(false)
     })
   })
+
+  describe('publish()', () => {
+    beforeEach(async () => {
+      await client.init()
+    })
+
+    it('should assert exchange, publish with persistent flag, and confirm', async () => {
+      await client.publish('test-exchange', 'test.key', { foo: 'bar' })
+
+      expect(mockChannel.assertExchange).toHaveBeenCalledWith('test-exchange', 'topic', { durable: true })
+      expect(mockChannel.publish).toHaveBeenCalledOnce()
+      const [exchange, routingKey, content, options] = mockChannel.publish.mock.calls[0]
+      expect(exchange).toBe('test-exchange')
+      expect(routingKey).toBe('test.key')
+      expect(JSON.parse(content.toString())).toEqual({ foo: 'bar' })
+      expect(options).toEqual({ persistent: true })
+      expect(mockChannel.waitForConfirms).toHaveBeenCalledOnce()
+    })
+
+    it('should retry with exponential backoff on failure', async () => {
+      mockChannel.waitForConfirms
+        .mockRejectedValueOnce(new Error('confirm failed'))
+        .mockResolvedValueOnce(undefined)
+
+      const publishPromise = client.publish('ex', 'key', { msg: 1 })
+      await vi.advanceTimersByTimeAsync(200)
+      await publishPromise
+
+      // First attempt failed, second succeeded after reconnect
+      expect(vi.mocked(amqp.connect)).toHaveBeenCalledTimes(2)
+    })
+
+    it('should throw after exhausting publishMaxAttempts', async () => {
+      mockChannel.waitForConfirms.mockRejectedValue(new Error('confirm failed'))
+
+      // Override to keep failing on new channels too
+      mockConnection.createConfirmChannel.mockImplementation(() => {
+        const failChannel = { ...mockChannel, waitForConfirms: vi.fn().mockRejectedValue(new Error('confirm failed')) }
+        return Promise.resolve(failChannel)
+      })
+
+      // Attach the rejection handler before advancing timers to avoid
+      // a brief "unhandled rejection" window during fake timer advancement.
+      const assertion = expect(client.publish('ex', 'key', { msg: 1 }, { maxAttempts: 2 })).rejects.toThrow(/2 attempts/)
+      await vi.advanceTimersByTimeAsync(500)
+
+      await assertion
+
+      // Restore for other tests
+      mockConnection.createConfirmChannel.mockResolvedValue(mockChannel)
+    })
+
+    it('should force reconnect on publish error (dead channel detection)', async () => {
+      mockChannel.waitForConfirms.mockRejectedValueOnce(new Error('dead'))
+
+      const publishPromise = client.publish('ex', 'key', { msg: 1 })
+      await vi.advanceTimersByTimeAsync(200)
+      await publishPromise
+
+      // connected was set to false, forcing reconnection
+      expect(vi.mocked(amqp.connect)).toHaveBeenCalledTimes(2)
+    })
+  })
 })
