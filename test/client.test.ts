@@ -375,4 +375,109 @@ describe('RabbitMQClient', () => {
       expect(await client.checkHealth()).toBe(false)
     })
   })
+
+  describe('reconnection', () => {
+    it('should reconnect and restore subscriptions on connection close', async () => {
+      const handler = vi.fn().mockResolvedValue(undefined)
+      await client.init()
+      await client.subscribe('ex', 'key', 'queue', handler)
+
+      // Capture the connection close handler
+      const closeHandler = mockConnection.on.mock.calls.find(
+        (call: unknown[]) => call[0] === 'close',
+      )![1] as () => void
+
+      // Reset mocks to track reconnection calls
+      vi.mocked(amqp.connect).mockClear()
+      mockChannel.consume.mockClear()
+
+      // Trigger connection close
+      closeHandler()
+      await vi.advanceTimersByTimeAsync(200)
+
+      // Should have reconnected
+      expect(amqp.connect).toHaveBeenCalledOnce()
+      // Should have restored the subscription
+      expect(mockChannel.consume).toHaveBeenCalledOnce()
+      expect(mockChannel.consume.mock.calls[0][0]).toBe('queue')
+      expect(client.isConnected()).toBe(true)
+    })
+
+    it('should reconnect on channel error', async () => {
+      await client.init()
+
+      const channelErrorHandler = mockChannel.on.mock.calls.find(
+        (call: unknown[]) => call[0] === 'error',
+      )![1] as (err: Error) => void
+
+      vi.mocked(amqp.connect).mockClear()
+
+      channelErrorHandler(new Error('channel died'))
+      await vi.advanceTimersByTimeAsync(200)
+
+      expect(amqp.connect).toHaveBeenCalledOnce()
+      expect(client.isConnected()).toBe(true)
+    })
+
+    it('should reconnect on channel close', async () => {
+      await client.init()
+
+      const channelCloseHandler = mockChannel.on.mock.calls.find(
+        (call: unknown[]) => call[0] === 'close',
+      )![1] as () => void
+
+      vi.mocked(amqp.connect).mockClear()
+
+      channelCloseHandler()
+      await vi.advanceTimersByTimeAsync(200)
+
+      expect(amqp.connect).toHaveBeenCalledOnce()
+      expect(client.isConnected()).toBe(true)
+    })
+
+    it('should preserve subscriptions across close(false) and re-init', async () => {
+      const handler = vi.fn().mockResolvedValue(undefined)
+      await client.init()
+      await client.subscribe('ex', 'key', 'queue', handler)
+
+      await client.close(false)
+      mockChannel.consume.mockClear()
+
+      await client.init()
+
+      // Trigger reconnection to test subscription restoration
+      const closeHandler = mockConnection.on.mock.calls.find(
+        (call: unknown[]) => call[0] === 'close',
+      )![1] as () => void
+
+      mockChannel.consume.mockClear()
+      closeHandler()
+      await vi.advanceTimersByTimeAsync(200)
+
+      expect(mockChannel.consume).toHaveBeenCalledOnce()
+      expect(mockChannel.consume.mock.calls[0][0]).toBe('queue')
+    })
+
+    it('should clear subscriptions on close() by default', async () => {
+      const handler = vi.fn().mockResolvedValue(undefined)
+      await client.init()
+      await client.subscribe('ex', 'key', 'queue', handler)
+
+      await client.close() // clears subscriptions
+
+      await client.init()
+      mockChannel.consume.mockClear()
+
+      // Trigger reconnection
+      const closeHandler = mockConnection.on.mock.calls.find(
+        (call: unknown[]) => call[0] === 'close',
+      )![1] as () => void
+
+      closeHandler()
+      await vi.advanceTimersByTimeAsync(200)
+
+      // No subscriptions to restore
+      expect(mockChannel.consume).not.toHaveBeenCalled()
+    })
+  })
 })
