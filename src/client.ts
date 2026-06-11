@@ -1,5 +1,6 @@
 import amqp from 'amqplib'
 import type {
+  ILogger,
   PublishOptions,
   RabbitMQClientOptions,
   RabbitMQHooks,
@@ -8,8 +9,7 @@ import type {
   RabbitMQSubscription,
   SubscribeOptions,
 } from './types.js'
-import { createLogger } from './logger.js'
-import type { Logger } from 'pino'
+import { silentLogger } from './logger.js'
 
 const DEFAULT_PREFETCH = 10
 const MAX_PUBLISH_RETRY_DELAY_MS = 60_000
@@ -43,7 +43,7 @@ export class RabbitMQClient {
   private connected = false
   private subscriptions: RabbitMQSubscription[] = []
   private readonly options: Required<Omit<RabbitMQClientOptions, 'logger' | 'hooks'>>
-  private readonly logger: Logger
+  private readonly logger: ILogger
   private readonly hooks: RabbitMQHooks
   private initializationPromise: Promise<void> | null = null
   private reconnectionPromise: Promise<void> | null = null
@@ -63,7 +63,7 @@ export class RabbitMQClient {
       prefetch: options.prefetch ?? DEFAULTS.prefetch,
       closeTimeout: options.closeTimeout ?? DEFAULTS.closeTimeout,
     }
-    this.logger = createLogger(options.logger)
+    this.logger = options.logger || silentLogger // using `??` would coalesces `false` as an authorized value making `this.logger` a boolean!
     this.hooks = options.hooks ?? {}
   }
 

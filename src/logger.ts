@@ -1,15 +1,19 @@
-import pino, { type Logger } from 'pino'
+import {type ILogger} from './types'
 
 /**
- * Creates a child pino logger for the RabbitMQ client.
+ * A No-Op (Silent) implementation of the ILogger interface.
  *
- * If a parent logger is provided, the child inherits its configuration
- * (level, transports, etc.) for unified log output. Otherwise, a new
- * root logger is created.
+ * Used as the default fallback when the consuming application does not
+ * inject its own logger. This ensures the library can call `this.logger.info()`
+ * internally without needing `if (this.logger)` null-checks everywhere, while
+ * keeping the standard output perfectly clean by default.
  */
-export const createLogger = (parent?: Logger): Logger => {
-  if (parent) {
-    return parent.child({ service: 'rabbitmq-client' })
-  }
-  return pino({ name: 'rabbitmq-client' })
-}
+export const silentLogger: ILogger = {
+  trace: () => {},
+  debug: () => {},
+  info: () => {},
+  log: () => {},
+  warn: () => {},
+  error: () => {},
+  fatal: () => {},
+};
