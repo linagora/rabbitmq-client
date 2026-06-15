@@ -1,26 +1,19 @@
 /**
- * The bare minimum logging contract required by this library.
+ * Minimal logging contract required by this library.
  *
- * You do not need to wrap your application's logger; you can pass instances
- * from Winston, Pino, Bunyan, or even the native `console` object directly.
- * Any additional methods on your provided logger will simply be ignored as
- * they are unused here.
+ * Calls are message-first (`logger.error('message', { context })`), matching
+ * `console`, Winston, and Bunyan, so you can pass any of them (or pino)
+ * directly without writing a wrapper. Only these four levels are used.
  */
 export interface ILogger {
-  /** Optional. Detailed diagnostic information. */
-  trace?(message: any, ...args: any[]): void;
-  /** Actionable insight for developers diagnosing issues. */
-  debug(message: any, ...args: any[]): void;
+  /** Detailed diagnostic information for developers. */
+  debug(message: string, ...args: unknown[]): void
   /** Routine informational messages about library operations. */
-  info(message: any, ...args: any[]): void;
-  /** Optional. Unused here. Unformatted informational messages. */
-  log?(message: any, ...args: any[]): void;
-  /** Warnings about non-fatal issues or deprecated usage. */
-  warn(message: any, ...args: any[]): void;
+  info(message: string, ...args: unknown[]): void
+  /** Warnings about non-fatal issues. */
+  warn(message: string, ...args: unknown[]): void
   /** Errors indicating an operation failed. */
-  error(message: any, ...args: any[]): void;
-  /** Optional. Critical errors requiring immediate application shutdown. */
-  fatal?(message: any, ...args: any[]): void;
+  error(message: string, ...args: unknown[]): void
 }
 
 /**
@@ -64,7 +57,7 @@ export interface RabbitMQClientOptions {
   publishMaxAttempts?: number
   /** Channel prefetch count (default: 10) */
   prefetch?: number
-  /** An already configure logger object complying with ILogger generic contract */
+  /** Logger satisfying the ILogger contract; defaults to console warn/error only if omitted */
   logger?: ILogger
   /** Timeout in ms to wait for in-flight messages during close (default: 5000) */
   closeTimeout?: number

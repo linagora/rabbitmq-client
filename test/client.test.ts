@@ -36,6 +36,7 @@ vi.mock('amqplib', () => ({
 
 import amqp from 'amqplib'
 import { RabbitMQClient } from '../src/client.js'
+import { silentLogger } from '../src/logger.js'
 
 const baseOptions = {
   url: 'amqp://localhost',
@@ -45,6 +46,7 @@ const baseOptions = {
   initMaxAttempts: 5,
   publishMaxAttempts: 5,
   prefetch: 10,
+  logger: silentLogger,
 }
 
 const createMessage = (content: unknown) => ({

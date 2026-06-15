@@ -9,7 +9,7 @@ import type {
   RabbitMQSubscription,
   SubscribeOptions,
 } from './types.js'
-import { silentLogger } from './logger.js'
+import { defaultLogger } from './logger.js'
 
 const DEFAULT_PREFETCH = 10
 const MAX_PUBLISH_RETRY_DELAY_MS = 60_000
@@ -63,7 +63,7 @@ export class RabbitMQClient {
       prefetch: options.prefetch ?? DEFAULTS.prefetch,
       closeTimeout: options.closeTimeout ?? DEFAULTS.closeTimeout,
     }
-    this.logger = options.logger || silentLogger // using `??` would coalesces `false` as an authorized value making `this.logger` a boolean!
+    this.logger = options.logger ?? defaultLogger
     this.hooks = options.hooks ?? {}
   }
 
@@ -101,11 +101,11 @@ export class RabbitMQClient {
         this.channel = await this.connection.createConfirmChannel()
         this.logger.info('Confirm channel created')
         await this.channel.prefetch(this.options.prefetch)
-        this.logger.info({ prefetch: this.options.prefetch }, 'Channel prefetch set')
+        this.logger.info('Channel prefetch set', { prefetch: this.options.prefetch })
 
         this.connection.on('error', (error: Error) => {
           this.connected = false
-          this.logger.error({ error }, 'Connection error')
+          this.logger.error('Connection error', { error })
         })
         this.connection.on('close', () => {
           this.connected = false
@@ -113,7 +113,7 @@ export class RabbitMQClient {
           this.reconnectWithRetry()
         })
         this.channel.on('error', (error: Error) => {
-          this.logger.error({ error }, 'Channel error')
+          this.logger.error('Channel error', { error })
           this.handleChannelFailure()
         })
         this.channel.on('close', () => {
@@ -127,21 +127,18 @@ export class RabbitMQClient {
         attempts++
         this.connected = false
         if (maxAttempts !== undefined && attempts >= maxAttempts) {
-          this.logger.error({ error, attempts, maxAttempts }, 'Connection failed after maximum attempts')
+          this.logger.error('Connection failed after maximum attempts', { error, attempts, maxAttempts })
           throw new Error(
             `Failed to connect to RabbitMQ after ${attempts} attempts. ` +
               'Check RABBITMQ_URL configuration and RabbitMQ server availability.',
           )
         }
-        this.logger.warn(
-          {
-            error,
-            attempt: attempts,
-            maxAttempts: maxAttempts ?? 'unlimited',
-            retryDelayMs: this.options.connectionRetryDelay,
-          },
-          'Connection attempt failed, retrying...',
-        )
+        this.logger.warn('Connection attempt failed, retrying...', {
+          error,
+          attempt: attempts,
+          maxAttempts: maxAttempts ?? 'unlimited',
+          retryDelayMs: this.options.connectionRetryDelay,
+        })
         await this.sleep(this.options.connectionRetryDelay)
       }
     }
@@ -203,11 +200,11 @@ export class RabbitMQClient {
         await this.channel.waitForConfirms()
 
         if (attempts > 0) {
-          this.logger.info({ exchange, routingKey, messageSize: content.length, attempts }, 'Published message after retries')
+          this.logger.info('Published message after retries', { exchange, routingKey, messageSize: content.length, attempts })
         } else {
-          this.logger.info({ exchange, routingKey, messageSize: content.length }, 'Published message')
+          this.logger.info('Published message', { exchange, routingKey, messageSize: content.length })
         }
-        this.logger.debug({ exchange, routingKey, payload: message }, 'Published message payload')
+        this.logger.debug('Published message payload', { exchange, routingKey, payload: message })
 
         this.callHook(this.hooks.onPublish, { exchange, routingKey, attempts: attempts + 1 })
 
@@ -217,10 +214,7 @@ export class RabbitMQClient {
         this.connected = false
 
         if (attempts >= maxAttempts) {
-          this.logger.error(
-            { error, exchange, routingKey, attempts, maxAttempts },
-            'Publish failed after max attempts',
-          )
+          this.logger.error('Publish failed after max attempts', { error, exchange, routingKey, attempts, maxAttempts })
           throw new Error(
             `Failed to publish to ${exchange}/${routingKey} after ${attempts} attempts: ${error instanceof Error ? error.message : String(error)}`,
           )
@@ -231,10 +225,7 @@ export class RabbitMQClient {
           MAX_PUBLISH_RETRY_DELAY_MS,
         )
 
-        this.logger.warn(
-          { error, exchange, routingKey, attempt: attempts, maxAttempts, retryDelayMs: retryDelay },
-          'Publish attempt failed, retrying',
-        )
+        this.logger.warn('Publish attempt failed, retrying', { error, exchange, routingKey, attempt: attempts, maxAttempts, retryDelayMs: retryDelay })
 
         await this.sleep(retryDelay)
       }
@@ -250,7 +241,7 @@ export class RabbitMQClient {
   async close(clearSubscriptions = true): Promise<void> {
     try {
       if (this.inflightCount > 0) {
-        this.logger.info({ inflightCount: this.inflightCount }, 'Waiting for in-flight messages to drain')
+        this.logger.info('Waiting for in-flight messages to drain', { inflightCount: this.inflightCount })
         await this.waitForDrain(this.options.closeTimeout)
       }
       await this.channel?.close()
@@ -267,7 +258,7 @@ export class RabbitMQClient {
       }
       this.logger.info('Connection closed')
     } catch (error) {
-      this.logger.error({ error }, 'Error closing connection')
+      this.logger.error('Error closing connection', { error })
       throw error
     }
   }
@@ -296,7 +287,7 @@ export class RabbitMQClient {
     if (this.subscriptions.length === 0) {
       return
     }
-    this.logger.info({ count: this.subscriptions.length }, 'Re-establishing subscriptions')
+    this.logger.info('Re-establishing subscriptions', { count: this.subscriptions.length })
     const subs = [...this.subscriptions]
     const results = await Promise.allSettled(
       subs.map(async (sub) => {
@@ -312,14 +303,14 @@ export class RabbitMQClient {
       } else {
         const queue = subs[index].queue
         failed.push(queue)
-        this.logger.error({ error: result.reason, queue }, 'Failed to re-subscribe to queue')
+        this.logger.error('Failed to re-subscribe to queue', { error: result.reason, queue })
       }
     })
     if (succeeded.length > 0) {
-      this.logger.info({ count: succeeded.length, queues: succeeded }, 'Successfully re-subscribed to queues')
+      this.logger.info('Successfully re-subscribed to queues', { count: succeeded.length, queues: succeeded })
     }
     if (failed.length > 0) {
-      this.logger.warn({ count: failed.length, queues: failed }, 'Some subscriptions failed to restore')
+      this.logger.warn('Some subscriptions failed to restore', { count: failed.length, queues: failed })
     }
     this.callHook(this.hooks.onReconnect, { subscriptionsRestored: succeeded.length, subscriptionsFailed: failed.length })
   }
@@ -360,7 +351,7 @@ export class RabbitMQClient {
     }
     this.consumerTags.delete(queue)
     this.subscriptions = this.subscriptions.filter((s) => s.queue !== queue)
-    this.logger.info({ queue }, 'Unsubscribed from queue')
+    this.logger.info('Unsubscribed from queue', { queue })
   }
 
   private async setupSubscription(sub: RabbitMQSubscription): Promise<void> {
@@ -404,14 +395,14 @@ export class RabbitMQClient {
       (message) => {
         if (message) {
           this.handleWithRetry(message, handler).catch((error) => {
-            this.logger.error({ error }, 'Unhandled error in message handler')
+            this.logger.error('Unhandled error in message handler', { error })
           })
         }
       },
       { noAck: false },
     )
     this.consumerTags.set(queue, consumerTag)
-    this.logger.info({ exchange, routingKey, queue }, 'Subscribed to queue')
+    this.logger.info('Subscribed to queue', { exchange, routingKey, queue })
   }
 
   private async handleWithRetry(
@@ -422,7 +413,7 @@ export class RabbitMQClient {
     // that delivered this message, even if a reconnection swaps this.channel.
     const channel = this.channel
     if (!channel) {
-      this.logger.warn('Cannot process message -- channel unavailable')
+      this.logger.warn('Cannot process message, channel unavailable')
       return
     }
     this.inflightCount++
@@ -438,46 +429,37 @@ export class RabbitMQClient {
       } catch (parseError) {
         const rawContent = message.content.toString()
         const rawPreview = rawContent.substring(0, 100)
-        this.logger.error(
-          {
-            error: parseError,
-            exchange,
-            routingKey,
-            rawContentPreview: rawPreview + (rawContent.length > 100 ? '...' : ''),
-          },
-          'Failed to parse message JSON, sending to DLQ',
-        )
+        this.logger.error('Failed to parse message JSON, sending to DLQ', {
+          error: parseError,
+          exchange,
+          routingKey,
+          rawContentPreview: rawPreview + (rawContent.length > 100 ? '...' : ''),
+        })
         channel.nack(message, false, false)
         this.callHook(this.hooks.onMessageDlq, { exchange, routingKey, duration: 0, reason: 'invalid_json' })
         return
       }
 
-      this.logger.debug({ exchange, routingKey, payload: content }, 'Message received, processing')
+      this.logger.debug('Message received, processing', { exchange, routingKey, payload: content })
 
       while (attempts < this.options.maxRetries) {
         try {
           await handler(content)
           const duration = Date.now() - startTime
-          this.logger.info(
-            { exchange, routingKey, duration, attempts: attempts + 1 },
-            'Message processed successfully',
-          )
+          this.logger.info('Message processed successfully', { exchange, routingKey, duration, attempts: attempts + 1 })
           channel.ack(message)
           this.callHook(this.hooks.onMessageProcessed, { exchange, routingKey, duration, attempts: attempts + 1 })
           return
         } catch (error) {
           attempts++
-          this.logger.error(
-            {
-              error: error instanceof Error ? error.message : error,
-              stack: error instanceof Error ? error.stack : undefined,
-              exchange,
-              routingKey,
-              attempt: attempts,
-              maxRetries: this.options.maxRetries,
-            },
-            'Handler failed',
-          )
+          this.logger.error('Handler failed', {
+            error: error instanceof Error ? error.message : error,
+            stack: error instanceof Error ? error.stack : undefined,
+            exchange,
+            routingKey,
+            attempt: attempts,
+            maxRetries: this.options.maxRetries,
+          })
           if (attempts < this.options.maxRetries) {
             await this.sleep(this.options.retryDelay)
           }
@@ -485,10 +467,7 @@ export class RabbitMQClient {
       }
 
       const duration = Date.now() - startTime
-      this.logger.error(
-        { exchange, routingKey, maxRetries: this.options.maxRetries, duration },
-        'Message failed after max retries, sending to DLQ',
-      )
+      this.logger.error('Message failed after max retries, sending to DLQ', { exchange, routingKey, maxRetries: this.options.maxRetries, duration })
       channel.nack(message, false, false)
       this.callHook(this.hooks.onMessageDlq, { exchange, routingKey, duration, reason: 'max_retries_exhausted' })
     } finally {
@@ -515,7 +494,7 @@ export class RabbitMQClient {
       await this.channel.deleteQueue(queue)
       return true
     } catch (error) {
-      this.logger.warn({ error }, 'Health check failed')
+      this.logger.warn('Health check failed', { error })
       return false
     }
   }
@@ -524,10 +503,7 @@ export class RabbitMQClient {
     if (this.inflightCount === 0) return Promise.resolve()
     return new Promise<void>((resolve) => {
       const timer = setTimeout(() => {
-        this.logger.warn(
-          { inflightCount: this.inflightCount },
-          'Close timeout reached with messages still in flight',
-        )
+        this.logger.warn('Close timeout reached with messages still in flight', { inflightCount: this.inflightCount })
         this.drainResolve = null
         resolve()
       }, timeout)
@@ -541,7 +517,7 @@ export class RabbitMQClient {
 
   /** Invokes a hook callback, swallowing errors so hooks never break message flow. */
   private callHook<T>(hook: ((info: T) => void) | undefined, info: T): void {
-    try { hook?.(info) } catch (error) { this.logger.debug({ error }, 'Observability hook error') }
+    try { hook?.(info) } catch (error) { this.logger.debug('Observability hook error', { error }) }
   }
 
   private sleep(ms: number): Promise<void> {
