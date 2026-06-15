@@ -39,7 +39,7 @@ Only `url` is required. Everything else has defaults.
 | `publishMaxAttempts` | `5` | Publish retries (exponential backoff, capped at 60s) |
 | `prefetch` | `10` | Channel prefetch count |
 | `closeTimeout` | `5000` | Milliseconds to wait for in-flight messages when closing |
-| `logger` | -- | Parent [pino](https://github.com/pinojs/pino) instance (the library creates its own if omitted) |
+| `logger` | -- | Any `ILogger` compatible logger class. Fallback to a no-op silent logger if not provided. |
 | `hooks` | -- | Observability callbacks (see [Hooks](#hooks)) |
 
 ## How it works
