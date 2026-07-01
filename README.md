@@ -37,7 +37,8 @@ Only `url` is required. Everything else has defaults.
 | `connectionRetryDelay` | `5000` | Milliseconds between reconnection attempts |
 | `initMaxAttempts` | `5` | Connection attempts on startup before giving up |
 | `publishMaxAttempts` | `5` | Publish retries (exponential backoff, capped at 60s) |
-| `prefetch` | `10` | Channel prefetch count |
+| `prefetch` | `10` | Channel prefetch: how many messages the broker delivers into consumer memory before waiting for acks |
+| `concurrency` | = `prefetch` | How many handlers run at once per subscription. Prefetch buffers messages in memory; concurrency bounds how many are processed simultaneously. Only throttles when set below `prefetch` (the broker never delivers more than `prefetch` unacked at a time); `0` means no limit. Override per queue via `subscribe(..., { concurrency })` |
 | `closeTimeout` | `5000` | Milliseconds to wait for in-flight messages when closing |
 | `logger` | console (warn/error) | Any `ILogger` (`console`, Winston, pino, Bunyan). Omitted: logs warn/error to the console, stays quiet otherwise. Pass `silentLogger` for no output. |
 | `hooks` | -- | Observability callbacks (see [Hooks](#hooks)) |
@@ -78,6 +79,15 @@ await client.subscribe('events', 'order.placed', 'order-queue', handler, {
 ```
 
 Custom arguments are merged with the DLQ wiring defaults, so you can swap the queue type or add a max-length without losing dead-letter routing.
+
+To limit how many messages this queue processes at once (for example, to protect a downstream database from a burst), set `concurrency` on the subscription. It defaults to the client-level `concurrency`, which in turn defaults to `prefetch`:
+
+```typescript
+// Buffer up to 50 messages in memory, but process at most 4 at a time.
+await client.subscribe('events', 'order.placed', 'order-queue', handler, {
+  concurrency: 4,
+})
+```
 
 ### Unsubscribing
 

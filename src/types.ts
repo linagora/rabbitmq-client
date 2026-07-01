@@ -37,6 +37,13 @@ export interface RabbitMQHooks {
 export interface SubscribeOptions {
   /** Override default AMQP queue arguments (merged with DLQ wiring defaults) */
   queueArguments?: Record<string, unknown>
+  /**
+   * Max message handlers to run concurrently for this subscription.
+   * Overrides the client-level `concurrency` for this queue only. Prefetch
+   * bounds messages held in memory; concurrency bounds how many are processed
+   * at once, and only throttles when set below `prefetch`. `0` means no limit.
+   */
+  concurrency?: number
 }
 
 /**
@@ -57,6 +64,15 @@ export interface RabbitMQClientOptions {
   publishMaxAttempts?: number
   /** Channel prefetch count (default: 10) */
   prefetch?: number
+  /**
+   * Max message handlers to run concurrently per subscription (default: equal
+   * to `prefetch`). Bounds how many `handler` callbacks execute at once, on top
+   * of how many messages prefetch keeps buffered in memory. Only throttles when
+   * set below `prefetch`, since the broker never delivers more than `prefetch`
+   * unacked messages at a time; `0` (or a negative value) means no limit.
+   * Override per queue via `SubscribeOptions.concurrency`.
+   */
+  concurrency?: number
   /** Logger satisfying the ILogger contract; defaults to console warn/error only if omitted */
   logger?: ILogger
   /** Timeout in ms to wait for in-flight messages during close (default: 5000) */
