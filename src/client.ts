@@ -10,6 +10,7 @@ import type {
   SubscribeOptions,
 } from './types.js'
 import { defaultLogger } from './logger.js'
+import { Semaphore } from './semaphore.js'
 
 const DEFAULT_PREFETCH = 10
 const MAX_PUBLISH_RETRY_DELAY_MS = 60_000
@@ -49,6 +50,11 @@ export class RabbitMQClient {
   private reconnectionPromise: Promise<void> | null = null
   private assertedExchanges = new Set<string>()
   private consumerTags = new Map<string, string>()
+  // Per-queue concurrency limiter, keyed by queue name. Persisted across
+  // reconnects (unlike consumerTags) so handlers still running when a
+  // connection drops keep holding their permits, and the new consumer cannot
+  // exceed the ceiling while the old pipeline drains. `null` = no limit.
+  private subscriptionSemaphores = new Map<string, Semaphore | null>()
   private inflightCount = 0
   private drainResolve: (() => void) | null = null
 
@@ -61,6 +67,11 @@ export class RabbitMQClient {
       initMaxAttempts: options.initMaxAttempts ?? DEFAULTS.initMaxAttempts,
       publishMaxAttempts: options.publishMaxAttempts ?? DEFAULTS.publishMaxAttempts,
       prefetch: options.prefetch ?? DEFAULTS.prefetch,
+      // Default concurrency tracks prefetch, preserving the previous behaviour
+      // (handlers ran fire-and-forget, so up to `prefetch` ran at once) while
+      // making the ceiling explicit and independently tunable. A value <= 0
+      // (including an unlimited `prefetch: 0`) means "no concurrency limit".
+      concurrency: options.concurrency ?? options.prefetch ?? DEFAULTS.prefetch,
       closeTimeout: options.closeTimeout ?? DEFAULTS.closeTimeout,
     }
     this.logger = options.logger ?? defaultLogger
@@ -255,6 +266,7 @@ export class RabbitMQClient {
       this.consumerTags.clear()
       if (clearSubscriptions) {
         this.subscriptions = []
+        this.subscriptionSemaphores.clear()
       }
       this.logger.info('Connection closed')
     } catch (error) {
@@ -337,6 +349,10 @@ export class RabbitMQClient {
       this.subscriptions.push(sub)
     } else {
       this.subscriptions[existingIndex] = sub
+      // Re-subscribing may change concurrency; drop the old limiter so
+      // setupSubscription rebuilds it from the new options. (A reconnect goes
+      // through setupSubscription directly and keeps the existing limiter.)
+      this.subscriptionSemaphores.delete(queue)
     }
     await this.setupSubscription(sub)
   }
@@ -350,6 +366,7 @@ export class RabbitMQClient {
       await this.channel.cancel(tag)
     }
     this.consumerTags.delete(queue)
+    this.subscriptionSemaphores.delete(queue)
     this.subscriptions = this.subscriptions.filter((s) => s.queue !== queue)
     this.logger.info('Unsubscribed from queue', { queue })
   }
@@ -358,17 +375,21 @@ export class RabbitMQClient {
     if (!this.channel) {
       throw new Error('Channel not available')
     }
+    // Bind this consumer to the exact channel that will deliver its messages,
+    // so ack/nack always target that channel even after a reconnect swaps
+    // `this.channel`.
+    const channel = this.channel
     const { exchange, routingKey, queue, handler, options } = sub
     const dlxExchange = `${exchange}.dlx`
     const dlqQueue = `${queue}.dlq`
     const dlqRoutingKey = `${routingKey}.dead`
 
-    await this.channel.assertExchange(dlxExchange, 'topic', { durable: true })
-    await this.channel.assertQueue(dlqQueue, { durable: true })
-    await this.channel.bindQueue(dlqQueue, dlxExchange, dlqRoutingKey)
+    await channel.assertExchange(dlxExchange, 'topic', { durable: true })
+    await channel.assertQueue(dlqQueue, { durable: true })
+    await channel.bindQueue(dlqQueue, dlxExchange, dlqRoutingKey)
 
     if (!this.assertedExchanges.has(exchange)) {
-      await this.channel.assertExchange(exchange, 'topic', { durable: true })
+      await channel.assertExchange(exchange, 'topic', { durable: true })
       this.assertedExchanges.add(exchange)
     }
 
@@ -382,21 +403,27 @@ export class RabbitMQClient {
       queueArgs['x-dead-letter-strategy'] = 'at-least-once'
     }
 
-    await this.channel.assertQueue(queue, {
+    await channel.assertQueue(queue, {
       durable: true,
       deadLetterExchange: dlxExchange,
       deadLetterRoutingKey: dlqRoutingKey,
       arguments: { ...queueArgs, ...options?.queueArguments },
     })
 
-    await this.channel.bindQueue(queue, exchange, routingKey)
-    const { consumerTag } = await this.channel.consume(
+    await channel.bindQueue(queue, exchange, routingKey)
+    // Reuse the queue's existing limiter across reconnects; only build a new
+    // one the first time (or after subscribe()/unsubscribe() cleared it).
+    // A concurrency <= 0 means "no limit" (null), matching an unlimited prefetch.
+    if (!this.subscriptionSemaphores.has(queue)) {
+      const concurrency = options?.concurrency ?? this.options.concurrency
+      this.subscriptionSemaphores.set(queue, concurrency > 0 ? new Semaphore(concurrency) : null)
+    }
+    const semaphore = this.subscriptionSemaphores.get(queue) ?? null
+    const { consumerTag } = await channel.consume(
       queue,
       (message) => {
         if (message) {
-          this.handleWithRetry(message, handler).catch((error) => {
-            this.logger.error('Unhandled error in message handler', { error })
-          })
+          this.dispatch(message, handler, semaphore, channel)
         }
       },
       { noAck: false },
@@ -405,77 +432,99 @@ export class RabbitMQClient {
     this.logger.info('Subscribed to queue', { exchange, routingKey, queue })
   }
 
+  /**
+   * Gates a delivered message on the subscription's concurrency semaphore, then
+   * processes it. A message counts as in-flight from delivery until its handler
+   * settles (including time spent waiting for a permit), so graceful `close()`
+   * drains queued messages as well as actively-processing ones.
+   */
+  private dispatch(
+    message: amqp.ConsumeMessage,
+    handler: RabbitMQMessageHandler,
+    semaphore: Semaphore | null,
+    channel: amqp.ConfirmChannel,
+  ): void {
+    this.inflightCount++
+    const acquire = semaphore ? semaphore.acquire() : Promise.resolve()
+    acquire
+      .then(() => this.handleWithRetry(message, handler, channel))
+      .catch((error) => {
+        this.logger.error('Unhandled error in message handler', { error })
+      })
+      .finally(() => {
+        semaphore?.release()
+        this.inflightCount--
+        if (this.inflightCount === 0 && this.drainResolve) {
+          this.drainResolve()
+        }
+      })
+  }
+
   private async handleWithRetry(
     message: amqp.ConsumeMessage,
     handler: RabbitMQMessageHandler,
+    channel: amqp.ConfirmChannel,
   ): Promise<void> {
-    // Capture the channel reference so ack/nack always targets the channel
-    // that delivered this message, even if a reconnection swaps this.channel.
-    const channel = this.channel
-    if (!channel) {
-      this.logger.warn('Cannot process message, channel unavailable')
+    // `channel` is the one that delivered this message. If a reconnect has
+    // since replaced it, this message was never acked and the broker will
+    // redeliver it on the new channel, so drop this stale attempt rather than
+    // run the handler again or ack a tag the new channel does not know.
+    if (channel !== this.channel) {
+      this.logger.warn('Skipping message from a superseded channel; it will be redelivered')
       return
     }
-    this.inflightCount++
-    try {
-      const startTime = Date.now()
-      let attempts = 0
-      const routingKey = message.fields.routingKey
-      const exchange = message.fields.exchange
+    const startTime = Date.now()
+    let attempts = 0
+    const routingKey = message.fields.routingKey
+    const exchange = message.fields.exchange
 
-      let content: RabbitMQMessage
+    let content: RabbitMQMessage
+    try {
+      content = JSON.parse(message.content.toString())
+    } catch (parseError) {
+      const rawContent = message.content.toString()
+      const rawPreview = rawContent.substring(0, 100)
+      this.logger.error('Failed to parse message JSON, sending to DLQ', {
+        error: parseError,
+        exchange,
+        routingKey,
+        rawContentPreview: rawPreview + (rawContent.length > 100 ? '...' : ''),
+      })
+      channel.nack(message, false, false)
+      this.callHook(this.hooks.onMessageDlq, { exchange, routingKey, duration: 0, reason: 'invalid_json' })
+      return
+    }
+
+    this.logger.debug('Message received, processing', { exchange, routingKey, payload: content })
+
+    while (attempts < this.options.maxRetries) {
       try {
-        content = JSON.parse(message.content.toString())
-      } catch (parseError) {
-        const rawContent = message.content.toString()
-        const rawPreview = rawContent.substring(0, 100)
-        this.logger.error('Failed to parse message JSON, sending to DLQ', {
-          error: parseError,
+        await handler(content)
+        const duration = Date.now() - startTime
+        this.logger.info('Message processed successfully', { exchange, routingKey, duration, attempts: attempts + 1 })
+        channel.ack(message)
+        this.callHook(this.hooks.onMessageProcessed, { exchange, routingKey, duration, attempts: attempts + 1 })
+        return
+      } catch (error) {
+        attempts++
+        this.logger.error('Handler failed', {
+          error: error instanceof Error ? error.message : error,
+          stack: error instanceof Error ? error.stack : undefined,
           exchange,
           routingKey,
-          rawContentPreview: rawPreview + (rawContent.length > 100 ? '...' : ''),
+          attempt: attempts,
+          maxRetries: this.options.maxRetries,
         })
-        channel.nack(message, false, false)
-        this.callHook(this.hooks.onMessageDlq, { exchange, routingKey, duration: 0, reason: 'invalid_json' })
-        return
-      }
-
-      this.logger.debug('Message received, processing', { exchange, routingKey, payload: content })
-
-      while (attempts < this.options.maxRetries) {
-        try {
-          await handler(content)
-          const duration = Date.now() - startTime
-          this.logger.info('Message processed successfully', { exchange, routingKey, duration, attempts: attempts + 1 })
-          channel.ack(message)
-          this.callHook(this.hooks.onMessageProcessed, { exchange, routingKey, duration, attempts: attempts + 1 })
-          return
-        } catch (error) {
-          attempts++
-          this.logger.error('Handler failed', {
-            error: error instanceof Error ? error.message : error,
-            stack: error instanceof Error ? error.stack : undefined,
-            exchange,
-            routingKey,
-            attempt: attempts,
-            maxRetries: this.options.maxRetries,
-          })
-          if (attempts < this.options.maxRetries) {
-            await this.sleep(this.options.retryDelay)
-          }
+        if (attempts < this.options.maxRetries) {
+          await this.sleep(this.options.retryDelay)
         }
       }
-
-      const duration = Date.now() - startTime
-      this.logger.error('Message failed after max retries, sending to DLQ', { exchange, routingKey, maxRetries: this.options.maxRetries, duration })
-      channel.nack(message, false, false)
-      this.callHook(this.hooks.onMessageDlq, { exchange, routingKey, duration, reason: 'max_retries_exhausted' })
-    } finally {
-      this.inflightCount--
-      if (this.inflightCount === 0 && this.drainResolve) {
-        this.drainResolve()
-      }
     }
+
+    const duration = Date.now() - startTime
+    this.logger.error('Message failed after max retries, sending to DLQ', { exchange, routingKey, maxRetries: this.options.maxRetries, duration })
+    channel.nack(message, false, false)
+    this.callHook(this.hooks.onMessageDlq, { exchange, routingKey, duration, reason: 'max_retries_exhausted' })
   }
 
   /**

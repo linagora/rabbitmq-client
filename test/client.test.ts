@@ -725,4 +725,141 @@ describe('RabbitMQClient', () => {
       await expect(hookClient.publish('ex', 'key', { msg: 1 })).resolves.toBeUndefined()
     })
   })
+
+  describe('processing concurrency', () => {
+    // A handler that blocks until explicitly released, tracking how many are
+    // running at once so we can assert the concurrency ceiling is respected.
+    function blockingHandler() {
+      let active = 0
+      let peak = 0
+      const releases: Array<() => void> = []
+      const handler = vi.fn().mockImplementation(
+        () =>
+          new Promise<void>((resolve) => {
+            active++
+            peak = Math.max(peak, active)
+            releases.push(() => {
+              active--
+              resolve()
+            })
+          }),
+      )
+      return {
+        handler,
+        get active() { return active },
+        get peak() { return peak },
+        releaseOne() { releases.shift()?.() },
+        // Drain any still-blocked handlers so a test never leaves permanently
+        // pending promises behind.
+        releaseAll() { while (releases.length) releases.shift()!() },
+      }
+    }
+
+    it('caps concurrent handler execution at the configured concurrency', async () => {
+      const c = new RabbitMQClient({ ...baseOptions, concurrency: 2 })
+      const deliver = setupConsumeCapture()
+      await c.init()
+      const h = blockingHandler()
+      await c.subscribe('ex', 'key', 'queue', h.handler)
+
+      for (let i = 0; i < 5; i++) deliver(createMessage({ n: i }))
+      await vi.advanceTimersByTimeAsync(0)
+
+      // Only two run; the other three wait on a permit.
+      expect(h.handler).toHaveBeenCalledTimes(2)
+      expect(h.active).toBe(2)
+
+      // Releasing one frees a permit, so exactly one queued message starts.
+      h.releaseOne()
+      await vi.advanceTimersByTimeAsync(0)
+      expect(h.handler).toHaveBeenCalledTimes(3)
+      expect(h.active).toBe(2)
+
+      h.releaseOne(); h.releaseOne(); h.releaseOne(); h.releaseOne()
+      await vi.advanceTimersByTimeAsync(0)
+      expect(h.handler).toHaveBeenCalledTimes(5)
+      expect(h.peak).toBe(2)
+    })
+
+    it('defaults concurrency to the prefetch value', async () => {
+      // baseOptions sets prefetch 10 and no explicit concurrency.
+      const deliver = setupConsumeCapture()
+      await client.init()
+      const h = blockingHandler()
+      await client.subscribe('ex', 'key', 'queue', h.handler)
+
+      for (let i = 0; i < 12; i++) deliver(createMessage({ n: i }))
+      await vi.advanceTimersByTimeAsync(0)
+
+      expect(h.handler).toHaveBeenCalledTimes(10)
+      expect(h.peak).toBe(10)
+      h.releaseAll()
+    })
+
+    it('lets a subscription override the client concurrency', async () => {
+      const c = new RabbitMQClient({ ...baseOptions, concurrency: 5 })
+      const deliver = setupConsumeCapture()
+      await c.init()
+      const h = blockingHandler()
+      await c.subscribe('ex', 'key', 'queue', h.handler, { concurrency: 1 })
+
+      for (let i = 0; i < 3; i++) deliver(createMessage({ n: i }))
+      await vi.advanceTimersByTimeAsync(0)
+
+      expect(h.handler).toHaveBeenCalledTimes(1)
+      expect(h.active).toBe(1)
+      h.releaseAll()
+    })
+
+    it('drains messages queued behind a full semaphore on graceful close()', async () => {
+      // concurrency 1 forces messages 2 and 3 to wait on a permit; a long
+      // closeTimeout ensures the test controls completion, not the timer.
+      const c = new RabbitMQClient({ ...baseOptions, concurrency: 1, closeTimeout: 60_000 })
+      const deliver = setupConsumeCapture()
+      await c.init()
+      const h = blockingHandler()
+      await c.subscribe('ex', 'key', 'queue', h.handler)
+
+      for (let i = 0; i < 3; i++) deliver(createMessage({ n: i }))
+      await vi.advanceTimersByTimeAsync(0)
+      expect(h.handler).toHaveBeenCalledTimes(1)
+
+      let closed = false
+      const closePromise = c.close().then(() => { closed = true })
+
+      // close() must not resolve until the permit-queued messages have run too.
+      h.releaseOne()
+      await vi.advanceTimersByTimeAsync(0)
+      expect(h.handler).toHaveBeenCalledTimes(2)
+      expect(closed).toBe(false)
+
+      h.releaseOne()
+      await vi.advanceTimersByTimeAsync(0)
+      expect(h.handler).toHaveBeenCalledTimes(3)
+      expect(closed).toBe(false)
+
+      h.releaseOne()
+      await vi.advanceTimersByTimeAsync(0)
+      await closePromise
+      expect(closed).toBe(true)
+    })
+
+    it('treats concurrency <= 0 (and an unlimited prefetch: 0) as no limit', async () => {
+      for (const opts of [{ concurrency: 0 }, { prefetch: 0 }]) {
+        const c = new RabbitMQClient({ ...baseOptions, ...opts })
+        const deliver = setupConsumeCapture()
+        await c.init()
+        const h = blockingHandler()
+        // Must not throw building an absent limiter (regression guard for
+        // new Semaphore(0)).
+        await expect(c.subscribe('ex', 'key', 'queue', h.handler)).resolves.toBeUndefined()
+
+        for (let i = 0; i < 15; i++) deliver(createMessage({ n: i }))
+        await vi.advanceTimersByTimeAsync(0)
+
+        expect(h.handler).toHaveBeenCalledTimes(15)
+        h.releaseAll()
+      }
+    })
+  })
 })
