@@ -490,21 +490,19 @@ export class RabbitMQClient {
         routingKey,
         rawContentPreview: rawPreview + (rawContent.length > 100 ? '...' : ''),
       })
-      channel.nack(message, false, false)
-      this.callHook(this.hooks.onMessageDlq, { exchange, routingKey, duration: 0, reason: 'invalid_json' })
+      if (this.settle(channel, message, 'nack')) {
+        this.callHook(this.hooks.onMessageDlq, { exchange, routingKey, duration: 0, reason: 'invalid_json' })
+      }
       return
     }
 
     this.logger.debug('Message received, processing', { exchange, routingKey, payload: content })
 
     while (attempts < this.options.maxRetries) {
+      // Only the handler call belongs in this try. Acking inside it would make
+      // a dead channel look like a failed handler and re-run its side effects.
       try {
         await handler(content)
-        const duration = Date.now() - startTime
-        this.logger.info('Message processed successfully', { exchange, routingKey, duration, attempts: attempts + 1 })
-        channel.ack(message)
-        this.callHook(this.hooks.onMessageProcessed, { exchange, routingKey, duration, attempts: attempts + 1 })
-        return
       } catch (error) {
         attempts++
         this.logger.error('Handler failed', {
@@ -518,13 +516,52 @@ export class RabbitMQClient {
         if (attempts < this.options.maxRetries) {
           await this.sleep(this.options.retryDelay)
         }
+        continue
       }
+      const duration = Date.now() - startTime
+      this.logger.info('Message processed successfully', { exchange, routingKey, duration, attempts: attempts + 1 })
+      if (this.settle(channel, message, 'ack')) {
+        this.callHook(this.hooks.onMessageProcessed, { exchange, routingKey, duration, attempts: attempts + 1 })
+      }
+      return
     }
 
     const duration = Date.now() - startTime
     this.logger.error('Message failed after max retries, sending to DLQ', { exchange, routingKey, maxRetries: this.options.maxRetries, duration })
-    channel.nack(message, false, false)
-    this.callHook(this.hooks.onMessageDlq, { exchange, routingKey, duration, reason: 'max_retries_exhausted' })
+    if (this.settle(channel, message, 'nack')) {
+      this.callHook(this.hooks.onMessageDlq, { exchange, routingKey, duration, reason: 'max_retries_exhausted' })
+    }
+  }
+
+  /**
+   * Acks or nacks a delivery, reporting whether the broker accepted it.
+   *
+   * A settle failure is a transport error, never a handler failure: by this
+   * point the handler has already run, so it must not be retried just because
+   * the channel went away. The delivery stays unacked and the broker redelivers
+   * it once the channel closes.
+   */
+  private settle(
+    channel: amqp.ConfirmChannel,
+    message: amqp.ConsumeMessage,
+    action: 'ack' | 'nack',
+  ): boolean {
+    try {
+      if (action === 'ack') {
+        channel.ack(message)
+      } else {
+        channel.nack(message, false, false)
+      }
+      return true
+    } catch (error) {
+      this.logger.error('Failed to settle message; leaving it unacked for redelivery', {
+        error,
+        action,
+        exchange: message.fields.exchange,
+        routingKey: message.fields.routingKey,
+      })
+      return false
+    }
   }
 
   /**
