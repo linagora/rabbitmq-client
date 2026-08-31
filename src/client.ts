@@ -546,6 +546,16 @@ export class RabbitMQClient {
     message: amqp.ConsumeMessage,
     action: 'ack' | 'nack',
   ): boolean {
+    // A handler can run for minutes, so the channel that delivered this
+    // message may have been replaced by a reconnect since the entry check.
+    // Settling on it would throw, and replaying the delivery tag on the
+    // current channel would settle an unrelated message, since tags are scoped
+    // to the channel that issued them. The broker requeues a closed channel's
+    // unacked deliveries, so let it be redelivered instead.
+    if (channel !== this.channel) {
+      this.logger.warn('Skipping message from a superseded channel; it will be redelivered')
+      return false
+    }
     try {
       if (action === 'ack') {
         channel.ack(message)
