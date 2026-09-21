@@ -327,8 +327,34 @@ describe('RabbitMQClient', () => {
       const msg = createMessage({ foo: 'bar' })
       deliver(msg)
       await vi.advanceTimersByTimeAsync(50)
-      expect(handler).toHaveBeenCalledWith({ foo: 'bar' })
+      expect(handler).toHaveBeenCalledWith({ foo: 'bar' }, { headers: {} })
       expect(mockChannel.ack).toHaveBeenCalledWith(msg)
+    })
+
+    it('should pass the delivery properties to the handler', async () => {
+      const handler = vi.fn().mockResolvedValue(undefined)
+      await client.subscribe('ex', 'key', 'queue', handler)
+      const xDeath = [{ count: 1, reason: 'rejected', queue: 'queue', time: { '!': 'timestamp', value: 1757000000 } }]
+      const msg = {
+        ...createMessage({ foo: 'bar' }),
+        properties: { headers: { 'x-death': xDeath }, timestamp: 1757000000, messageId: 'm-1', correlationId: 'c-1' },
+      }
+      deliver(msg)
+      await vi.advanceTimersByTimeAsync(50)
+      expect(handler).toHaveBeenCalledWith({ foo: 'bar' }, {
+        headers: { 'x-death': xDeath },
+        timestamp: 1757000000,
+        messageId: 'm-1',
+        correlationId: 'c-1',
+      })
+    })
+
+    it('should pass empty headers when the delivery carries none', async () => {
+      const handler = vi.fn().mockResolvedValue(undefined)
+      await client.subscribe('ex', 'key', 'queue', handler)
+      deliver({ ...createMessage({ foo: 'bar' }), properties: {} })
+      await vi.advanceTimersByTimeAsync(50)
+      expect(handler).toHaveBeenCalledWith({ foo: 'bar' }, { headers: {} })
     })
 
     it('should nack invalid JSON immediately to DLQ', async () => {

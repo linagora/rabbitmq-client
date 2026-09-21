@@ -1,4 +1,5 @@
 import { EventEmitter } from 'events'
+import type { RabbitMQMessageProperties } from '../types.js'
 
 // ---------------------------------------------------------------------------
 // Framework-agnostic mock function factory
@@ -99,10 +100,11 @@ export class MockRabbitMQChannel extends EventEmitter {
   // ---------------------------------------------------------------------------
 
   /**
-   * Delivers a valid JSON message to the registered consume callback.
+   * Delivers a valid JSON message to the registered consume callback, with
+   * optional AMQP properties such as `headers` or `timestamp`.
    */
-  simulateMessage(content: unknown): void {
-    this._deliver(Buffer.from(JSON.stringify(content)))
+  simulateMessage(content: unknown, properties: Partial<RabbitMQMessageProperties> = {}): void {
+    this._deliver(Buffer.from(JSON.stringify(content)), properties)
   }
 
   /**
@@ -112,12 +114,12 @@ export class MockRabbitMQChannel extends EventEmitter {
     this._deliver(Buffer.from('not valid json {'))
   }
 
-  private _deliver(content: Buffer): void {
+  private _deliver(content: Buffer, properties: Partial<RabbitMQMessageProperties> = {}): void {
     if (!this._consumeCallback) return
     this._consumeCallback({
       content,
       fields: { deliveryTag: 1, redelivered: false, exchange: '', routingKey: '', consumerTag: 'mock-consumer' },
-      properties: { headers: {} },
+      properties: { headers: {}, ...properties },
     })
   }
 
