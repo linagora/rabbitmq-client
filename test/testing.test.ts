@@ -26,6 +26,15 @@ describe('MockRabbitMQChannel', () => {
     expect(JSON.parse(msg.content.toString())).toEqual({ test: 'data' })
   })
 
+  it('should simulate a message with properties', () => {
+    const channel = new MockRabbitMQChannel()
+    const handler = vi.fn()
+    channel.consume('queue', handler)
+    channel.simulateMessage({ test: 'data' }, { headers: { 'x-death': [] }, timestamp: 1757000000 })
+    const msg = handler.mock.calls[0][0]
+    expect(msg.properties).toEqual({ headers: { 'x-death': [] }, timestamp: 1757000000 })
+  })
+
   it('should simulate invalid JSON message', () => {
     const channel = new MockRabbitMQChannel()
     const handler = vi.fn()

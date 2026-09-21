@@ -103,6 +103,15 @@ After unsubscribing, the queue will not be re-subscribed on reconnection.
 
 Incoming messages are JSON-parsed first. If that fails, the message goes straight to the DLQ (no point retrying garbage). Otherwise, your handler runs up to `maxRetries` times. Success means ack, final failure means nack to the DLQ.
 
+The handler also receives what the publisher and the broker attached to the delivery: `headers`, `timestamp`, `messageId` and `correlationId`. A handler that only needs the body can ignore it.
+
+```typescript
+await client.subscribe('events', 'order.placed', 'order-queue', async (message, { headers }) => {
+  // `x-death` is set by the broker on a message that went through a DLQ
+  const replayed = headers['x-death'] !== undefined
+})
+```
+
 ### Reconnection
 
 If the connection or channel drops, the client reconnects and re-subscribes to everything automatically. Multiple reconnection triggers (e.g. connection close + channel close firing at the same time) are collapsed into a single attempt.

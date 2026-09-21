@@ -6,6 +6,7 @@ import type {
   RabbitMQHooks,
   RabbitMQMessage,
   RabbitMQMessageHandler,
+  RabbitMQMessageProperties,
   RabbitMQSubscription,
   SubscribeOptions,
 } from './types.js'
@@ -184,6 +185,9 @@ export class RabbitMQClient {
     const maxAttempts = options?.maxAttempts ?? this.options.publishMaxAttempts
     const baseDelay = this.options.connectionRetryDelay
     const content = Buffer.from(JSON.stringify(message))
+    // Taken once, not per attempt: a retried publish must not look newer than
+    // a message published after it succeeded.
+    const timestamp = Math.floor(Date.now() / 1000)
 
     while (attempts < maxAttempts) {
       try {
@@ -202,6 +206,7 @@ export class RabbitMQClient {
 
         this.channel.publish(exchange, routingKey, content, {
           persistent: true,
+          timestamp,
           headers: options?.headers,
           correlationId: options?.correlationId,
           messageId: options?.messageId,
@@ -498,11 +503,18 @@ export class RabbitMQClient {
 
     this.logger.debug('Message received, processing', { exchange, routingKey, payload: content })
 
+    const properties: RabbitMQMessageProperties = {
+      headers: message.properties.headers ?? {},
+      timestamp: message.properties.timestamp,
+      messageId: message.properties.messageId,
+      correlationId: message.properties.correlationId,
+    }
+
     while (attempts < this.options.maxRetries) {
       // Only the handler call belongs in this try. Acking inside it would make
       // a dead channel look like a failed handler and re-run its side effects.
       try {
-        await handler(content)
+        await handler(content, properties)
       } catch (error) {
         attempts++
         this.logger.error('Handler failed', {

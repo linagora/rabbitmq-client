@@ -100,8 +100,23 @@ export interface PublishOptions {
 /** JSON-serializable message payload */
 export type RabbitMQMessage = Record<string, unknown>
 
+/** What the publisher and the broker attached to a consumed message */
+export interface RabbitMQMessageProperties {
+  /** AMQP headers, including broker-added ones such as `x-death` on a dead-lettered message */
+  headers: Record<string, unknown>
+  /** AMQP timestamp in seconds, if the publisher set one */
+  timestamp?: number
+  /** Unique message identifier, if the publisher set one */
+  messageId?: string
+  /** Correlation ID, if the publisher set one */
+  correlationId?: string
+}
+
 /** Async handler function for consumed messages */
-export type RabbitMQMessageHandler = (message: RabbitMQMessage) => Promise<void>
+export type RabbitMQMessageHandler = (
+  message: RabbitMQMessage,
+  properties: RabbitMQMessageProperties,
+) => Promise<void>
 
 /** Stored subscription metadata for restoration after reconnection */
 export interface RabbitMQSubscription {

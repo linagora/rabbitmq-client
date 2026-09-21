@@ -7,6 +7,7 @@ export type {
   RabbitMQHooks,
   RabbitMQMessage,
   RabbitMQMessageHandler,
+  RabbitMQMessageProperties,
   RabbitMQSubscription,
   SubscribeOptions,
 } from './types.js'
