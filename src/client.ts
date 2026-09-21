@@ -10,7 +10,7 @@ import type {
   RabbitMQSubscription,
   SubscribeOptions,
 } from './types.js'
-import { defaultLogger } from './logger.js'
+import { defaultLogger, forLibraryCalls } from './logger.js'
 import { Semaphore } from './semaphore.js'
 
 const DEFAULT_PREFETCH = 10
@@ -75,7 +75,7 @@ export class RabbitMQClient {
       concurrency: options.concurrency ?? options.prefetch ?? DEFAULTS.prefetch,
       closeTimeout: options.closeTimeout ?? DEFAULTS.closeTimeout,
     }
-    this.logger = options.logger ?? defaultLogger
+    this.logger = forLibraryCalls(options.logger ?? defaultLogger)
     this.hooks = options.hooks ?? {}
   }
 

@@ -1,5 +1,7 @@
 import { describe, it, expect, vi, afterEach } from 'vitest'
-import { defaultLogger, silentLogger } from '../src/logger.js'
+import { Writable } from 'stream'
+import pino from 'pino'
+import { defaultLogger, forLibraryCalls, silentLogger } from '../src/logger.js'
 import type { ILogger } from '../src/types.js'
 
 describe('defaultLogger', () => {
@@ -66,5 +68,43 @@ describe('ILogger compatibility', () => {
     custom.error('Connection error', { error: 'boom' })
 
     expect(calls).toEqual([['error', 'Connection error', { error: 'boom' }]])
+  })
+})
+
+describe('forLibraryCalls', () => {
+  const capture = () => {
+    const lines: Record<string, unknown>[] = []
+    const stream = new Writable({
+      write(chunk, _enc, done) {
+        lines.push(JSON.parse(chunk.toString()))
+        done()
+      },
+    })
+    return { lines, logger: pino({ level: 'debug' }, stream) }
+  }
+
+  it('keeps the context of a pino logger, with errors under err', () => {
+    const { lines, logger } = capture()
+
+    forLibraryCalls(logger).error('Handler failed', { routingKey: 'user.deleted', error: new Error('boom') })
+
+    expect(lines[0]).toMatchObject({
+      msg: 'Handler failed',
+      routingKey: 'user.deleted',
+      err: { type: 'Error', message: 'boom' },
+    })
+  })
+
+  it('logs a pino message that carries no context', () => {
+    const { lines, logger } = capture()
+
+    forLibraryCalls(logger).info('Connected to server')
+
+    expect(lines[0]).toMatchObject({ msg: 'Connected to server' })
+  })
+
+  it('leaves a message-first logger untouched', () => {
+    expect(forLibraryCalls(console)).toBe(console)
+    expect(forLibraryCalls(silentLogger)).toBe(silentLogger)
   })
 })

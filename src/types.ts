@@ -2,8 +2,9 @@
  * Minimal logging contract required by this library.
  *
  * Calls are message-first (`logger.error('message', { context })`), matching
- * `console`, Winston, and Bunyan, so you can pass any of them (or pino)
- * directly without writing a wrapper. Only these four levels are used.
+ * `console`, Winston, and Bunyan. A pino logger is recognised and called
+ * pino's way (`(context, message)`, errors under `err`), so any of them can be
+ * passed directly without writing a wrapper. Only these four levels are used.
  */
 export interface ILogger {
   /** Detailed diagnostic information for developers. */
