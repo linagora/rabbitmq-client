@@ -200,7 +200,8 @@ describe('RabbitMQClient', () => {
       await client.init()
     })
 
-    it('should assert exchange, publish with persistent flag, and confirm', async () => {
+    it('should assert exchange, publish with persistent flag and timestamp, and confirm', async () => {
+      vi.setSystemTime(1757000000500)
       await client.publish('test-exchange', 'test.key', { foo: 'bar' })
 
       expect(mockChannel.assertExchange).toHaveBeenCalledWith('test-exchange', 'topic', { durable: true })
@@ -209,7 +210,7 @@ describe('RabbitMQClient', () => {
       expect(exchange).toBe('test-exchange')
       expect(routingKey).toBe('test.key')
       expect(JSON.parse(content.toString())).toEqual({ foo: 'bar' })
-      expect(options).toEqual({ persistent: true })
+      expect(options).toEqual({ persistent: true, timestamp: 1757000000 })
       expect(mockChannel.waitForConfirms).toHaveBeenCalledOnce()
     })
 
@@ -224,6 +225,21 @@ describe('RabbitMQClient', () => {
 
       // First attempt failed, second succeeded after reconnect
       expect(vi.mocked(amqp.connect)).toHaveBeenCalledTimes(2)
+    })
+
+    it('should keep the first attempt timestamp across retries', async () => {
+      // One millisecond before a second boundary, so the retry lands in the next second
+      vi.setSystemTime(1757000000999)
+      mockChannel.waitForConfirms
+        .mockRejectedValueOnce(new Error('confirm failed'))
+        .mockResolvedValueOnce(undefined)
+
+      const publishPromise = client.publish('ex', 'key', { msg: 1 })
+      await vi.advanceTimersByTimeAsync(5000)
+      await publishPromise
+
+      const timestamps = mockChannel.publish.mock.calls.map((call) => call[3].timestamp)
+      expect(timestamps).toEqual([1757000000, 1757000000])
     })
 
     it('should throw after exhausting publishMaxAttempts', async () => {

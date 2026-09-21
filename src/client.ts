@@ -185,6 +185,9 @@ export class RabbitMQClient {
     const maxAttempts = options?.maxAttempts ?? this.options.publishMaxAttempts
     const baseDelay = this.options.connectionRetryDelay
     const content = Buffer.from(JSON.stringify(message))
+    // Taken once, not per attempt: a retried publish must not look newer than
+    // a message published after it succeeded.
+    const timestamp = Math.floor(Date.now() / 1000)
 
     while (attempts < maxAttempts) {
       try {
@@ -203,6 +206,7 @@ export class RabbitMQClient {
 
         this.channel.publish(exchange, routingKey, content, {
           persistent: true,
+          timestamp,
           headers: options?.headers,
           correlationId: options?.correlationId,
           messageId: options?.messageId,
