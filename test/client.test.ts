@@ -35,7 +35,7 @@ vi.mock('amqplib', () => ({
 }))
 
 import amqp from 'amqplib'
-import { RabbitMQClient } from '../src/client.js'
+import { RabbitMQClient, UnroutableMessageError } from '../src/client.js'
 import { silentLogger } from '../src/logger.js'
 
 const baseOptions = {
@@ -212,6 +212,83 @@ describe('RabbitMQClient', () => {
       expect(JSON.parse(content.toString())).toEqual({ foo: 'bar' })
       expect(options).toEqual({ persistent: true, timestamp: 1757000000 })
       expect(mockChannel.waitForConfirms).toHaveBeenCalledOnce()
+    })
+
+    it('should publish straight to a queue through the default exchange without declaring it', async () => {
+      await client.publish('', 'orders.queue', { foo: 'bar' })
+
+      expect(mockChannel.assertExchange).not.toHaveBeenCalled()
+      expect(mockChannel.publish).toHaveBeenCalledWith('', 'orders.queue', expect.any(Buffer), expect.any(Object))
+      expect(mockChannel.waitForConfirms).toHaveBeenCalledOnce()
+    })
+
+    describe('mandatory', () => {
+      /** Delivers a basic.return to the channel, as the broker does for an unroutable mandatory message. */
+      function emitReturn(msg: { fields: object; content: Buffer; properties: object }) {
+        mockChannel.on.mock.calls.findLast(([event]) => event === 'return')?.[1](msg)
+      }
+
+      function returnEveryPublish() {
+        mockChannel.publish.mockImplementation(((exchange: string, routingKey: string, content: Buffer) => {
+          emitReturn({ fields: { exchange, routingKey, replyCode: 312 }, content, properties: {} })
+          return true
+        }) as typeof mockChannel.publish)
+      }
+
+      it('should reject an unroutable message without retrying or reconnecting', async () => {
+        returnEveryPublish()
+
+        await expect(client.publish('', 'gone.queue', { foo: 'bar' }, { mandatory: true })).rejects.toBeInstanceOf(
+          UnroutableMessageError,
+        )
+
+        expect(mockChannel.publish).toHaveBeenCalledOnce()
+        expect(mockChannel.publish.mock.calls[0][3]).toMatchObject({ mandatory: true })
+        expect(vi.mocked(amqp.connect)).toHaveBeenCalledOnce()
+      })
+
+      it('should resolve when the message was routed', async () => {
+        await client.publish('', 'orders.queue', { foo: 'bar' }, { mandatory: true })
+
+        expect(mockChannel.waitForConfirms).toHaveBeenCalledOnce()
+      })
+
+      it('should ignore the return of the same message id sent to another queue', async () => {
+        mockChannel.publish.mockImplementation((() => {
+          emitReturn({ fields: { exchange: '', routingKey: 'other.queue' }, content: Buffer.from('{}'), properties: { messageId: 'a' } })
+          return true
+        }) as typeof mockChannel.publish)
+
+        await expect(
+          client.publish('', 'orders.queue', { foo: 'bar' }, { mandatory: true, messageId: 'a' }),
+        ).resolves.toBeUndefined()
+      })
+
+      it('should tell two in-flight messages with the same content apart by message id', async () => {
+        const confirms: (() => void)[] = []
+        mockChannel.waitForConfirms.mockImplementation(() => new Promise<void>((resolve) => confirms.push(resolve)))
+
+        const first = client.publish('', 'orders.queue', { foo: 'bar' }, { mandatory: true, messageId: 'a' })
+        const second = client.publish('', 'orders.queue', { foo: 'bar' }, { mandatory: true, messageId: 'b' })
+        await vi.advanceTimersByTimeAsync(0)
+
+        emitReturn({
+          fields: { exchange: '', routingKey: 'orders.queue', replyCode: 312 },
+          content: Buffer.from(JSON.stringify({ foo: 'bar' })),
+          properties: { messageId: 'a' },
+        })
+        for (const confirm of confirms) confirm()
+
+        await expect(first).rejects.toBeInstanceOf(UnroutableMessageError)
+        await expect(second).resolves.toBeUndefined()
+        expect(mockChannel.on.mock.calls.filter(([event]) => event === 'return')).toHaveLength(1)
+      })
+
+      it('should resolve an ordinary publish the broker returns', async () => {
+        returnEveryPublish()
+
+        await expect(client.publish('ex', 'key', { foo: 'bar' })).resolves.toBeUndefined()
+      })
     })
 
     it('should retry with exponential backoff on failure', async () => {

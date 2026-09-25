@@ -1,4 +1,4 @@
-export { RabbitMQClient } from './client.js'
+export { RabbitMQClient, UnroutableMessageError } from './client.js'
 export { defaultLogger, silentLogger } from './logger.js'
 export type {
   ILogger,
