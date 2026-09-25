@@ -26,6 +26,17 @@ const DEFAULTS = {
   closeTimeout: 5000,
 } as const
 
+/** A `mandatory` publish the broker could route to no queue. */
+export class UnroutableMessageError extends Error {
+  constructor(
+    readonly exchange: string,
+    readonly routingKey: string,
+  ) {
+    super(`No queue is bound to receive ${exchange || '(default exchange)'}/${routingKey}`)
+    this.name = 'UnroutableMessageError'
+  }
+}
+
 /**
  * Production-grade RabbitMQ client with confirm channels, automatic DLQ
  * infrastructure, reconnection with subscription restoration, and
@@ -50,6 +61,8 @@ export class RabbitMQClient {
   private initializationPromise: Promise<void> | null = null
   private reconnectionPromise: Promise<void> | null = null
   private assertedExchanges = new Set<string>()
+  // One per channel, so a late return on a replaced channel reaches no waiter.
+  private returnWaiters = new Set<(msg: amqp.Message) => void>()
   private consumerTags = new Map<string, string>()
   // Per-queue concurrency limiter, keyed by queue name. Persisted across
   // reconnects (unlike consumerTags) so handlers still running when a
@@ -111,6 +124,11 @@ export class RabbitMQClient {
         this.connection = await amqp.connect(this.options.url)
         this.logger.info('Connected to server')
         this.channel = await this.connection.createConfirmChannel()
+        const returnWaiters = new Set<(msg: amqp.Message) => void>()
+        this.returnWaiters = returnWaiters
+        this.channel.on('return', (msg: amqp.Message) => {
+          for (const waiter of returnWaiters) waiter(msg)
+        })
         this.logger.info('Confirm channel created')
         await this.channel.prefetch(this.options.prefetch)
         this.logger.info('Channel prefetch set', { prefetch: this.options.prefetch })
@@ -207,16 +225,41 @@ export class RabbitMQClient {
           this.assertedExchanges.add(exchange)
         }
 
-        this.channel.publish(exchange, routingKey, content, {
-          persistent: true,
-          timestamp,
-          headers: options?.headers,
-          correlationId: options?.correlationId,
-          messageId: options?.messageId,
-          expiration: options?.expiration,
-        })
+        const channel = this.channel
+        const returnWaiters = this.returnWaiters
+        // The broker sends basic.return before the confirm of the same message,
+        // so the flag is settled by the time waitForConfirms resolves. A return
+        // carries no delivery tag, so it is matched on where it was sent plus the
+        // message id, or the content when there is none.
+        let returned = false
+        const messageId = options?.messageId
+        const onReturn = (msg: amqp.Message) => {
+          if (msg.fields.exchange !== exchange || msg.fields.routingKey !== routingKey) return
+          if (messageId !== undefined ? msg.properties.messageId === messageId : msg.content.equals(content)) {
+            returned = true
+          }
+        }
+        if (options?.mandatory) returnWaiters.add(onReturn)
 
-        await this.channel.waitForConfirms()
+        try {
+          channel.publish(exchange, routingKey, content, {
+            persistent: true,
+            timestamp,
+            headers: options?.headers,
+            correlationId: options?.correlationId,
+            messageId: options?.messageId,
+            expiration: options?.expiration,
+            mandatory: options?.mandatory,
+          })
+
+          await channel.waitForConfirms()
+        } finally {
+          returnWaiters.delete(onReturn)
+        }
+
+        if (returned) {
+          throw new UnroutableMessageError(exchange, routingKey)
+        }
 
         if (attempts > 0) {
           this.logger.info('Published message after retries', { exchange, routingKey, messageSize: content.length, attempts })
@@ -229,13 +272,19 @@ export class RabbitMQClient {
 
         return
       } catch (error) {
+        // The broker answered, and the same routing would fail the same way.
+        if (error instanceof UnroutableMessageError) {
+          this.logger.warn('Published message was unroutable', { exchange, routingKey })
+          throw error
+        }
+
         attempts++
         this.connected = false
 
         if (attempts >= maxAttempts) {
           this.logger.error('Publish failed after max attempts', { error, exchange, routingKey, attempts, maxAttempts })
           throw new Error(
-            `Failed to publish to ${exchange}/${routingKey} after ${attempts} attempts: ${error instanceof Error ? error.message : String(error)}`,
+            `Failed to publish to ${exchange || '(default exchange)'}/${routingKey} after ${attempts} attempts: ${error instanceof Error ? error.message : String(error)}`,
           )
         }
 

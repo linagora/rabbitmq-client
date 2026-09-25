@@ -66,6 +66,20 @@ To reach one queue directly, publish to the default exchange (`''`) with the que
 await client.publish('', 'orders.queue', { orderId: '42' })
 ```
 
+A confirm only says the broker accepted the message, not that any queue got it. Pass `mandatory: true` to reject with `UnroutableMessageError` when no queue is bound to receive it. That error is not retried, since the same routing would fail the same way.
+
+```typescript
+import { UnroutableMessageError } from '@linagora/rabbitmq-client'
+
+try {
+  await client.publish('', 'orders.queue', { orderId: '42' }, { mandatory: true })
+} catch (error) {
+  if (error instanceof UnroutableMessageError) {
+    // orders.queue does not exist
+  }
+}
+```
+
 ### Subscribing
 
 Each call to `subscribe` wires up the DLQ plumbing for you:

@@ -96,6 +96,11 @@ export interface PublishOptions {
   messageId?: string
   /** Per-message TTL in milliseconds (as string per AMQP spec) */
   expiration?: string
+  /**
+   * Reject with `UnroutableMessageError` when the broker routes the message to
+   * no queue, instead of resolving on the confirm. Not retried.
+   */
+  mandatory?: boolean
 }
 
 /** JSON-serializable message payload */
