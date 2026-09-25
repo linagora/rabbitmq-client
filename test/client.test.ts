@@ -214,6 +214,14 @@ describe('RabbitMQClient', () => {
       expect(mockChannel.waitForConfirms).toHaveBeenCalledOnce()
     })
 
+    it('should publish straight to a queue through the default exchange without declaring it', async () => {
+      await client.publish('', 'orders.queue', { foo: 'bar' })
+
+      expect(mockChannel.assertExchange).not.toHaveBeenCalled()
+      expect(mockChannel.publish).toHaveBeenCalledWith('', 'orders.queue', expect.any(Buffer), expect.any(Object))
+      expect(mockChannel.waitForConfirms).toHaveBeenCalledOnce()
+    })
+
     it('should retry with exponential backoff on failure', async () => {
       mockChannel.waitForConfirms
         .mockRejectedValueOnce(new Error('confirm failed'))

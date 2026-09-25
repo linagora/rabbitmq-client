@@ -60,6 +60,12 @@ await client.publish('auth', 'user.created', { userId: '123' }, {
 })
 ```
 
+To reach one queue directly, publish to the default exchange (`''`) with the queue name as the routing key. The client does not declare the default exchange, since it always exists.
+
+```typescript
+await client.publish('', 'orders.queue', { orderId: '42' })
+```
+
 ### Subscribing
 
 Each call to `subscribe` wires up the DLQ plumbing for you:

@@ -171,7 +171,8 @@ export class RabbitMQClient {
   }
 
   /**
-   * Publishes a JSON message to a topic exchange with publisher confirms.
+   * Publishes a JSON message to a topic exchange with publisher confirms, or
+   * straight to a queue through the default exchange (`''`, routing key = queue name).
    * Retries with exponential backoff (capped at 60 s), forcing a reconnect
    * on each failure. Throws after `publishMaxAttempts` exhausted.
    */
@@ -199,7 +200,9 @@ export class RabbitMQClient {
           throw new Error('Channel not available')
         }
 
-        if (!this.assertedExchanges.has(exchange)) {
+        // The default exchange ('') always exists and the broker refuses to
+        // declare it, so publishing straight to a queue skips the assertion.
+        if (exchange !== '' && !this.assertedExchanges.has(exchange)) {
           await this.channel.assertExchange(exchange, 'topic', { durable: true })
           this.assertedExchanges.add(exchange)
         }
