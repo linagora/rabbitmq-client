@@ -176,6 +176,54 @@ describe('RabbitMQClient', () => {
 
       await expect(client.close()).rejects.toThrow('close failed')
     })
+
+    it('should not reconnect when closing fires the channel and connection close events', async () => {
+      await client.init()
+      // amqplib emits 'close' on the channel and the connection when they are closed.
+      const handler = (target: { on: { mock: { calls: unknown[][] } } }, event: string) =>
+        target.on.mock.calls.findLast(([name]) => name === event)?.[1] as () => void
+      mockChannel.close.mockImplementationOnce(async () => handler(mockChannel, 'close')())
+      mockConnection.close.mockImplementationOnce(async () => handler(mockConnection, 'close')())
+
+      await client.close()
+      await vi.advanceTimersByTimeAsync(60_000)
+
+      expect(vi.mocked(amqp.connect)).toHaveBeenCalledOnce()
+      expect(client.isConnected()).toBe(false)
+    })
+
+    it('should stop a retrying init and resubscribe nothing when closed mid-connect', async () => {
+      const onReconnect = vi.fn()
+      const c = new RabbitMQClient({ ...baseOptions, hooks: { onReconnect } })
+      vi.mocked(amqp.connect).mockRejectedValueOnce(new Error('down'))
+      const init = c.init()
+      init.catch(() => undefined)
+
+      const closed = c.close()
+      await vi.advanceTimersByTimeAsync(baseOptions.connectionRetryDelay)
+      await closed
+
+      await expect(init).rejects.toThrow('closed while connecting')
+      expect(vi.mocked(amqp.connect)).toHaveBeenCalledOnce()
+      expect(onReconnect).not.toHaveBeenCalled()
+      expect(c.isConnected()).toBe(false)
+    })
+
+    it('should ignore close events from a connection a reconnect replaced', async () => {
+      await client.init()
+      const staleClose = mockConnection.on.mock.calls.find(([name]) => name === 'close')![1] as () => void
+      const freshConnection = { ...mockConnection, on: vi.fn().mockReturnThis(), close: vi.fn().mockResolvedValue(undefined) }
+      vi.mocked(amqp.connect).mockResolvedValueOnce(freshConnection as unknown as Connection)
+      staleClose()
+      await vi.advanceTimersByTimeAsync(100)
+      vi.mocked(amqp.connect).mockClear()
+
+      staleClose()
+      await vi.advanceTimersByTimeAsync(100)
+
+      expect(vi.mocked(amqp.connect)).not.toHaveBeenCalled()
+      expect(client.isConnected()).toBe(true)
+    })
   })
 
   describe('isConnected()', () => {

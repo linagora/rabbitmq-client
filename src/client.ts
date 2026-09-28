@@ -54,6 +54,7 @@ export class RabbitMQClient {
   private connection: amqp.ChannelModel | null = null
   private channel: amqp.ConfirmChannel | null = null
   private connected = false
+  private closing = false
   private subscriptions: RabbitMQSubscription[] = []
   private readonly options: Required<Omit<RabbitMQClientOptions, 'logger' | 'hooks'>>
   private readonly logger: ILogger
@@ -118,35 +119,47 @@ export class RabbitMQClient {
   private async doConnect(maxAttempts?: number): Promise<void> {
     this.assertedExchanges.clear()
     this.consumerTags.clear()
+    // A channel failure leaves its connection open; drop it so it does not
+    // outlive the client and keep the process alive.
+    this.connection?.close().catch(() => undefined)
+    this.connection = null
     let attempts = 0
-    while (!this.connected) {
+    while (!this.connected && !this.closing) {
       try {
-        this.connection = await amqp.connect(this.options.url)
+        const connection = await amqp.connect(this.options.url)
+        this.connection = connection
         this.logger.info('Connected to server')
-        this.channel = await this.connection.createConfirmChannel()
+        const channel = await connection.createConfirmChannel()
+        this.channel = channel
         const returnWaiters = new Set<(msg: amqp.Message) => void>()
         this.returnWaiters = returnWaiters
-        this.channel.on('return', (msg: amqp.Message) => {
+        channel.on('return', (msg: amqp.Message) => {
           for (const waiter of returnWaiters) waiter(msg)
         })
         this.logger.info('Confirm channel created')
-        await this.channel.prefetch(this.options.prefetch)
+        await channel.prefetch(this.options.prefetch)
         this.logger.info('Channel prefetch set', { prefetch: this.options.prefetch })
 
-        this.connection.on('error', (error: Error) => {
+        // Events from a connection or channel a reconnect has replaced must not
+        // tear down the current one.
+        connection.on('error', (error: Error) => {
+          if (connection !== this.connection) return
           this.connected = false
           this.logger.error('Connection error', { error })
         })
-        this.connection.on('close', () => {
+        connection.on('close', () => {
+          if (connection !== this.connection) return
           this.connected = false
           this.logger.warn('Connection closed')
           this.reconnectWithRetry()
         })
-        this.channel.on('error', (error: Error) => {
+        channel.on('error', (error: Error) => {
+          if (channel !== this.channel) return
           this.logger.error('Channel error', { error })
           this.handleChannelFailure()
         })
-        this.channel.on('close', () => {
+        channel.on('close', () => {
+          if (channel !== this.channel) return
           this.logger.warn('Channel closed')
           this.handleChannelFailure()
         })
@@ -171,6 +184,9 @@ export class RabbitMQClient {
         })
         await this.sleep(this.options.connectionRetryDelay)
       }
+    }
+    if (!this.connected) {
+      throw new Error('RabbitMQ client closed while connecting')
     }
   }
 
@@ -307,13 +323,22 @@ export class RabbitMQClient {
    * `init()` / reconnect cycle.
    */
   async close(clearSubscriptions = true): Promise<void> {
+    // Closing the channel fires its 'close' handler, which would otherwise
+    // reconnect and leave a connection behind that keeps the process alive.
+    this.closing = true
     try {
+      // A connect already running gives up after its current attempt; whatever
+      // it opened is closed below.
+      await Promise.allSettled([this.initializationPromise, this.reconnectionPromise])
       if (this.inflightCount > 0) {
         this.logger.info('Waiting for in-flight messages to drain', { inflightCount: this.inflightCount })
         await this.waitForDrain(this.options.closeTimeout)
       }
-      await this.channel?.close()
-      await this.connection?.close()
+      try {
+        await this.channel?.close()
+      } finally {
+        await this.connection?.close()
+      }
       this.connection = null
       this.channel = null
       this.connected = false
@@ -329,10 +354,13 @@ export class RabbitMQClient {
     } catch (error) {
       this.logger.error('Error closing connection', { error })
       throw error
+    } finally {
+      this.closing = false
     }
   }
 
   private async reconnectWithRetry(): Promise<void> {
+    if (this.closing) return
     if (this.reconnectionPromise) {
       return this.reconnectionPromise
     }
@@ -342,6 +370,10 @@ export class RabbitMQClient {
     this.reconnectionPromise.catch(() => undefined)
     try {
       await this.reconnectionPromise
+    } catch (error) {
+      // The event handlers call this without awaiting it, so a reconnect that
+      // close() interrupted must not surface as an unhandled rejection.
+      if (!this.closing) throw error
     } finally {
       this.reconnectionPromise = null
     }
