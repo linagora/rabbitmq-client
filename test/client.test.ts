@@ -828,6 +828,19 @@ describe('RabbitMQClient', () => {
       expect(mockChannel.assertExchange).not.toHaveBeenCalledWith('b2b', 'topic', { durable: true })
     })
 
+    it('should check only the listed exchanges and declare the others', async () => {
+      const handler = vi.fn().mockResolvedValue(undefined)
+      await client.subscribe('space', 'twake.space.#', 'queue', handler, {
+        bindings: [{ exchange: 'activity', routingKey: '#' }],
+        passiveExchanges: ['space'],
+      })
+
+      expect(mockProbeChannel.checkExchange).toHaveBeenCalledWith('space')
+      expect(mockProbeChannel.checkExchange).not.toHaveBeenCalledWith('activity')
+      expect(mockChannel.assertExchange).toHaveBeenCalledWith('activity', 'topic', { durable: true })
+      expect(mockChannel.assertExchange).not.toHaveBeenCalledWith('space', 'topic', { durable: true })
+    })
+
     it('should fail to subscribe when a passive exchange is missing, and not restore it on reconnection', async () => {
       mockProbeChannel.checkExchange.mockRejectedValueOnce(new Error('NOT_FOUND - no exchange'))
       const handler = vi.fn().mockResolvedValue(undefined)

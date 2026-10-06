@@ -501,13 +501,15 @@ export class RabbitMQClient {
     await channel.assertQueue(dlqQueue, { durable: true })
     await channel.bindQueue(dlqQueue, dlxExchange, dlqRoutingKey)
 
-    const missing = bindings.map((b) => b.exchange).filter((name) => !this.assertedExchanges.has(name))
-    if (options?.passiveExchanges && missing.length > 0) {
-      await this.checkExchanges(missing)
-    } else {
-      for (const name of missing) {
-        await channel.assertExchange(name, 'topic', { durable: true })
-      }
+    const passive = options?.passiveExchanges
+    const isPassive = (name: string) => passive === true || (Array.isArray(passive) && passive.includes(name))
+    const missing = [...new Set(bindings.map((b) => b.exchange))].filter((name) => !this.assertedExchanges.has(name))
+    const toCheck = missing.filter(isPassive)
+    if (toCheck.length > 0) {
+      await this.checkExchanges(toCheck)
+    }
+    for (const name of missing.filter((name) => !isPassive(name))) {
+      await channel.assertExchange(name, 'topic', { durable: true })
     }
     for (const name of missing) this.assertedExchanges.add(name)
 

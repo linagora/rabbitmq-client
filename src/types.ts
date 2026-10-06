@@ -51,9 +51,10 @@ export interface SubscribeOptions {
   deadLetterExchange?: string
   /**
    * Check that the source exchanges exist instead of declaring them, for
-   * exchanges another service owns. Subscribing fails when one is missing.
+   * exchanges another service owns: `true` for all of them, or a list of
+   * names. Subscribing fails when one is missing.
    */
-  passiveExchanges?: boolean
+  passiveExchanges?: boolean | string[]
   /** Max handler attempts before the DLQ for this queue (overrides the client default); `Infinity` retries until the handler succeeds */
   maxRetries?: number
   /**

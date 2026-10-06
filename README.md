@@ -109,7 +109,7 @@ await client.subscribe('events', 'order.placed', 'order-queue', handler, {
 })
 ```
 
-One queue can take messages from several exchanges. Pass the other bindings in `bindings`; they share the queue, its consumer and its DLQ, and are restored on reconnection. Name the dead letter exchange after the queue with `deadLetterExchange`, so it does not live under another service's exchange. For exchanges another service owns, `passiveExchanges` checks they exist instead of declaring them, and `subscribe` fails when one is missing:
+One queue can take messages from several exchanges. Pass the other bindings in `bindings`; they share the queue, its consumer and its DLQ, and are restored on reconnection. Name the dead letter exchange after the queue with `deadLetterExchange`, so it does not live under another service's exchange. For exchanges another service owns, `passiveExchanges` checks they exist instead of declaring them, and `subscribe` fails when one is missing. Pass `true` for every exchange, or a list of names to check those and declare the rest:
 
 ```typescript
 await client.subscribe('space', 'twake.space.#', 'twake-space', handler, {
