@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import type { Connection, ConfirmChannel } from 'amqplib'
 
 // Hoist mock objects so they are available inside the vi.mock factory
-const { mockChannel, mockConnection } = vi.hoisted(() => {
+const { mockChannel, mockProbeChannel, mockConnection } = vi.hoisted(() => {
   const mockChannel = {
     prefetch: vi.fn().mockResolvedValue(undefined),
     on: vi.fn().mockReturnThis(),
@@ -19,13 +19,20 @@ const { mockChannel, mockConnection } = vi.hoisted(() => {
     cancel: vi.fn().mockResolvedValue(undefined),
   } as unknown as ConfirmChannel & Record<string, ReturnType<typeof vi.fn>>
 
+  const mockProbeChannel = {
+    on: vi.fn().mockReturnThis(),
+    close: vi.fn().mockResolvedValue(undefined),
+    checkExchange: vi.fn().mockResolvedValue({}),
+  } as unknown as ConfirmChannel & Record<string, ReturnType<typeof vi.fn>>
+
   const mockConnection = {
     createConfirmChannel: vi.fn().mockResolvedValue(mockChannel),
+    createChannel: vi.fn().mockResolvedValue(mockProbeChannel),
     on: vi.fn().mockReturnThis(),
     close: vi.fn().mockResolvedValue(undefined),
   } as unknown as Connection & Record<string, ReturnType<typeof vi.fn>>
 
-  return { mockChannel, mockConnection }
+  return { mockChannel, mockProbeChannel, mockConnection }
 })
 
 vi.mock('amqplib', () => ({
@@ -35,7 +42,7 @@ vi.mock('amqplib', () => ({
 }))
 
 import amqp from 'amqplib'
-import { RabbitMQClient, UnroutableMessageError } from '../src/client.js'
+import { DeadLetterError, RabbitMQClient, UnroutableMessageError } from '../src/client.js'
 import { silentLogger } from '../src/logger.js'
 
 const baseOptions = {
@@ -75,6 +82,9 @@ describe('RabbitMQClient', () => {
     mockChannel.on.mockReturnThis()
     mockChannel.close.mockResolvedValue(undefined)
     mockChannel.assertExchange.mockResolvedValue({})
+    mockProbeChannel.on.mockReturnThis()
+    mockProbeChannel.close.mockResolvedValue(undefined)
+    mockProbeChannel.checkExchange.mockResolvedValue({})
     mockChannel.assertQueue.mockResolvedValue({ queue: 'test-queue' })
     mockChannel.bindQueue.mockResolvedValue({})
     mockChannel.publish.mockReturnValue(true)
@@ -84,6 +94,7 @@ describe('RabbitMQClient', () => {
     mockChannel.cancel.mockResolvedValue(undefined)
 
     mockConnection.createConfirmChannel.mockResolvedValue(mockChannel)
+    mockConnection.createChannel.mockResolvedValue(mockProbeChannel)
     mockConnection.on.mockReturnThis()
     mockConnection.close.mockResolvedValue(undefined)
 
@@ -468,7 +479,7 @@ describe('RabbitMQClient', () => {
       const msg = createMessage({ foo: 'bar' })
       deliver(msg)
       await vi.advanceTimersByTimeAsync(50)
-      expect(handler).toHaveBeenCalledWith({ foo: 'bar' }, { headers: {} })
+      expect(handler).toHaveBeenCalledWith({ foo: 'bar' }, { exchange: 'ex', routingKey: 'key', headers: {} })
       expect(mockChannel.ack).toHaveBeenCalledWith(msg)
     })
 
@@ -483,6 +494,8 @@ describe('RabbitMQClient', () => {
       deliver(msg)
       await vi.advanceTimersByTimeAsync(50)
       expect(handler).toHaveBeenCalledWith({ foo: 'bar' }, {
+        exchange: 'ex',
+        routingKey: 'key',
         headers: { 'x-death': xDeath },
         timestamp: 1757000000,
         messageId: 'm-1',
@@ -495,7 +508,7 @@ describe('RabbitMQClient', () => {
       await client.subscribe('ex', 'key', 'queue', handler)
       deliver({ ...createMessage({ foo: 'bar' }), properties: {} })
       await vi.advanceTimersByTimeAsync(50)
-      expect(handler).toHaveBeenCalledWith({ foo: 'bar' }, { headers: {} })
+      expect(handler).toHaveBeenCalledWith({ foo: 'bar' }, { exchange: 'ex', routingKey: 'key', headers: {} })
     })
 
     it('should nack invalid JSON immediately to DLQ', async () => {
@@ -530,6 +543,62 @@ describe('RabbitMQClient', () => {
       expect(handler).toHaveBeenCalledTimes(3) // maxRetries = 3
       expect(mockChannel.ack).not.toHaveBeenCalled()
       expect(mockChannel.nack).toHaveBeenCalledWith(msg, false, false)
+    })
+
+    it('should nack to DLQ at once on DeadLetterError', async () => {
+      const onMessageDlq = vi.fn()
+      client = new RabbitMQClient({ ...baseOptions, hooks: { onMessageDlq } })
+      await client.init()
+      const handler = vi.fn().mockRejectedValue(new DeadLetterError('bad event'))
+      await client.subscribe('ex', 'key', 'queue', handler)
+      const msg = createMessage({ foo: 'bar' })
+      deliver(msg)
+      await vi.advanceTimersByTimeAsync(500)
+      expect(handler).toHaveBeenCalledOnce()
+      expect(mockChannel.nack).toHaveBeenCalledWith(msg, false, false)
+      expect(onMessageDlq).toHaveBeenCalledWith(expect.objectContaining({ reason: 'dead_letter_error' }))
+    })
+
+    it('should use the subscription maxRetries', async () => {
+      const handler = vi.fn().mockRejectedValue(new Error('always fails'))
+      await client.subscribe('ex', 'key', 'queue', handler, { maxRetries: 5 })
+      deliver(createMessage({ foo: 'bar' }))
+      await vi.advanceTimersByTimeAsync(500)
+      expect(handler).toHaveBeenCalledTimes(5)
+      expect(mockChannel.nack).toHaveBeenCalledOnce()
+    })
+
+    it('should double the retry delay up to maxRetryDelay', async () => {
+      const handler = vi.fn().mockRejectedValue(new Error('db down'))
+      await client.subscribe('ex', 'key', 'queue', handler, { maxRetries: Infinity, maxRetryDelay: 40 })
+      deliver(createMessage({ foo: 'bar' }))
+      // retryDelay is 10: attempts at 0, 10, 30, 70, 110 (capped at 40 from then on)
+      await vi.advanceTimersByTimeAsync(0)
+      expect(handler).toHaveBeenCalledTimes(1)
+      await vi.advanceTimersByTimeAsync(10)
+      expect(handler).toHaveBeenCalledTimes(2)
+      await vi.advanceTimersByTimeAsync(20)
+      expect(handler).toHaveBeenCalledTimes(3)
+      await vi.advanceTimersByTimeAsync(40)
+      expect(handler).toHaveBeenCalledTimes(4)
+      await vi.advanceTimersByTimeAsync(40)
+      expect(handler).toHaveBeenCalledTimes(5)
+      expect(mockChannel.nack).not.toHaveBeenCalled()
+    })
+
+    it('should stop an unbounded retry on close and leave the message unacked', async () => {
+      const handler = vi.fn().mockRejectedValue(new Error('db down'))
+      await client.subscribe('ex', 'key', 'queue', handler, { maxRetries: Infinity, maxRetryDelay: 60_000 })
+      deliver(createMessage({ foo: 'bar' }))
+      await vi.advanceTimersByTimeAsync(100)
+      const calls = handler.mock.calls.length
+
+      await client.close()
+
+      await vi.advanceTimersByTimeAsync(120_000)
+      expect(handler).toHaveBeenCalledTimes(calls)
+      expect(mockChannel.ack).not.toHaveBeenCalled()
+      expect(mockChannel.nack).not.toHaveBeenCalled()
     })
   })
 
@@ -712,6 +781,87 @@ describe('RabbitMQClient', () => {
           'x-max-length': 1000,
         },
       })
+    })
+
+    it('should bind one queue to several exchanges', async () => {
+      const handler = vi.fn().mockResolvedValue(undefined)
+      await client.subscribe('space', 'twake.space.#', 'queue', handler, {
+        bindings: [
+          { exchange: 'b2b', routingKey: 'domain.user.deleted' },
+          { exchange: 'auth', routingKey: 'user.deleted' },
+        ],
+      })
+
+      expect(mockChannel.assertExchange).toHaveBeenCalledWith('b2b', 'topic', { durable: true })
+      expect(mockChannel.assertExchange).toHaveBeenCalledWith('auth', 'topic', { durable: true })
+      expect(mockChannel.bindQueue).toHaveBeenCalledWith('queue', 'space', 'twake.space.#')
+      expect(mockChannel.bindQueue).toHaveBeenCalledWith('queue', 'b2b', 'domain.user.deleted')
+      expect(mockChannel.bindQueue).toHaveBeenCalledWith('queue', 'auth', 'user.deleted')
+      expect(mockChannel.consume).toHaveBeenCalledOnce()
+    })
+
+    it('should use the given dead letter exchange', async () => {
+      const handler = vi.fn().mockResolvedValue(undefined)
+      await client.subscribe('space', 'twake.space.#', 'queue', handler, {
+        deadLetterExchange: 'queue.dlx',
+      })
+
+      expect(mockChannel.assertExchange).toHaveBeenCalledWith('queue.dlx', 'topic', { durable: true })
+      expect(mockChannel.assertExchange).not.toHaveBeenCalledWith('space.dlx', 'topic', { durable: true })
+      expect(mockChannel.bindQueue).toHaveBeenCalledWith('queue.dlq', 'queue.dlx', 'twake.space.#.dead')
+      expect(mockChannel.assertQueue).toHaveBeenCalledWith('queue', expect.objectContaining({
+        deadLetterExchange: 'queue.dlx',
+      }))
+    })
+
+    it('should check source exchanges instead of declaring them when passive', async () => {
+      const handler = vi.fn().mockResolvedValue(undefined)
+      await client.subscribe('space', 'twake.space.#', 'queue', handler, {
+        bindings: [{ exchange: 'b2b', routingKey: 'domain.user.deleted' }],
+        passiveExchanges: true,
+      })
+
+      expect(mockProbeChannel.checkExchange).toHaveBeenCalledWith('space')
+      expect(mockProbeChannel.checkExchange).toHaveBeenCalledWith('b2b')
+      expect(mockProbeChannel.close).toHaveBeenCalledOnce()
+      expect(mockChannel.assertExchange).not.toHaveBeenCalledWith('space', 'topic', { durable: true })
+      expect(mockChannel.assertExchange).not.toHaveBeenCalledWith('b2b', 'topic', { durable: true })
+    })
+
+    it('should fail to subscribe when a passive exchange is missing, and not restore it on reconnection', async () => {
+      mockProbeChannel.checkExchange.mockRejectedValueOnce(new Error('NOT_FOUND - no exchange'))
+      const handler = vi.fn().mockResolvedValue(undefined)
+      await expect(client.subscribe('admin-panel', 'dns.validated', 'queue', handler, {
+        passiveExchanges: true,
+      })).rejects.toThrow('NOT_FOUND')
+      expect(mockChannel.consume).not.toHaveBeenCalled()
+      expect(mockChannel.close).not.toHaveBeenCalled()
+
+      const closeHandler = mockConnection.on.mock.calls.find(
+        (call: unknown[]) => call[0] === 'close',
+      )![1] as () => void
+      closeHandler()
+      await vi.advanceTimersByTimeAsync(200)
+      expect(mockProbeChannel.checkExchange).toHaveBeenCalledOnce()
+      expect(mockChannel.consume).not.toHaveBeenCalled()
+    })
+
+    it('should restore every binding after reconnection', async () => {
+      const handler = vi.fn().mockResolvedValue(undefined)
+      await client.subscribe('space', 'twake.space.#', 'queue', handler, {
+        bindings: [{ exchange: 'b2b', routingKey: 'domain.user.deleted' }],
+      })
+
+      const closeHandler = mockConnection.on.mock.calls.find(
+        (call: unknown[]) => call[0] === 'close',
+      )![1] as () => void
+
+      mockChannel.bindQueue.mockClear()
+      closeHandler()
+      await vi.advanceTimersByTimeAsync(200)
+
+      expect(mockChannel.bindQueue).toHaveBeenCalledWith('queue', 'space', 'twake.space.#')
+      expect(mockChannel.bindQueue).toHaveBeenCalledWith('queue', 'b2b', 'domain.user.deleted')
     })
 
     it('should preserve custom options across reconnection', async () => {

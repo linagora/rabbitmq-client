@@ -59,6 +59,7 @@ export class MockRabbitMQChannel extends EventEmitter {
 
   // Stubs
   readonly assertExchange = mockFn().mockResolvedValue({})
+  readonly checkExchange = mockFn().mockResolvedValue({})
   readonly assertQueue = mockFn().mockResolvedValue({ queue: '' })
   readonly bindQueue = mockFn().mockResolvedValue({})
   readonly ack = mockFn()
@@ -116,10 +117,11 @@ export class MockRabbitMQChannel extends EventEmitter {
 
   private _deliver(content: Buffer, properties: Partial<RabbitMQMessageProperties> = {}): void {
     if (!this._consumeCallback) return
+    const { exchange = '', routingKey = '', ...amqpProperties } = properties
     this._consumeCallback({
       content,
-      fields: { deliveryTag: 1, redelivered: false, exchange: '', routingKey: '', consumerTag: 'mock-consumer' },
-      properties: { headers: {}, ...properties },
+      fields: { deliveryTag: 1, redelivered: false, exchange, routingKey, consumerTag: 'mock-consumer' },
+      properties: { headers: {}, ...amqpProperties },
     })
   }
 
@@ -197,6 +199,11 @@ export class MockRabbitMQConnection extends EventEmitter {
     const ch = new MockRabbitMQChannel()
     this._channels.push(ch)
     return Promise.resolve(ch)
+  }
+
+  /** Creates an untracked plain channel, as used for passive exchange checks. */
+  createChannel(): Promise<MockRabbitMQChannel> {
+    return Promise.resolve(new MockRabbitMQChannel())
   }
 
   close(): Promise<void> {
