@@ -27,7 +27,7 @@ export interface RabbitMQHooks {
   /** Called after a message handler returns successfully (duration includes retries) */
   onMessageProcessed?: (info: { exchange: string; routingKey: string; duration: number; attempts: number }) => void
   /** Called when a message is nacked to the dead-letter queue */
-  onMessageDlq?: (info: { exchange: string; routingKey: string; duration: number; reason: 'invalid_json' | 'max_retries_exhausted' }) => void
+  onMessageDlq?: (info: { exchange: string; routingKey: string; duration: number; reason: 'invalid_json' | 'max_retries_exhausted' | 'dead_letter_error' }) => void
   /** Called after reconnection completes and subscriptions are re-established */
   onReconnect?: (info: { subscriptionsRestored: number; subscriptionsFailed: number }) => void
 }
@@ -45,6 +45,28 @@ export interface SubscribeOptions {
    * at once, and only throttles when set below `prefetch`. `0` means no limit.
    */
   concurrency?: number
+  /** More exchanges and routing keys to bind the same queue to, consumed by the same handler */
+  bindings?: RabbitMQBinding[]
+  /** Dead-letter exchange name (default: `<exchange>.dlx`) */
+  deadLetterExchange?: string
+  /**
+   * Check that the source exchanges exist instead of declaring them, for
+   * exchanges another service owns. Subscribing fails when one is missing.
+   */
+  passiveExchanges?: boolean
+  /** Max handler attempts before the DLQ for this queue (overrides the client default); `Infinity` retries until the handler succeeds */
+  maxRetries?: number
+  /**
+   * Double the delay between handler attempts, from `retryDelay` up to this
+   * many ms. Without it the delay stays at `retryDelay`.
+   */
+  maxRetryDelay?: number
+}
+
+/** An exchange and routing key a queue is bound to */
+export interface RabbitMQBinding {
+  exchange: string
+  routingKey: string
 }
 
 /**
@@ -108,6 +130,10 @@ export type RabbitMQMessage = Record<string, unknown>
 
 /** What the publisher and the broker attached to a consumed message */
 export interface RabbitMQMessageProperties {
+  /** Exchange the message was published to */
+  exchange: string
+  /** Routing key the message was published with */
+  routingKey: string
   /** AMQP headers, including broker-added ones such as `x-death` on a dead-lettered message */
   headers: Record<string, unknown>
   /** AMQP timestamp in seconds, if the publisher set one */

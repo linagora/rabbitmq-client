@@ -109,6 +109,19 @@ await client.subscribe('events', 'order.placed', 'order-queue', handler, {
 })
 ```
 
+One queue can take messages from several exchanges. Pass the other bindings in `bindings`; they share the queue, its consumer and its DLQ, and are restored on reconnection. Name the dead letter exchange after the queue with `deadLetterExchange`, so it does not live under another service's exchange. For exchanges another service owns, `passiveExchanges` checks they exist instead of declaring them, and `subscribe` fails when one is missing:
+
+```typescript
+await client.subscribe('space', 'twake.space.#', 'twake-space', handler, {
+  bindings: [
+    { exchange: 'b2b', routingKey: 'domain.user.deleted' },
+    { exchange: 'auth', routingKey: 'user.deleted' },
+  ],
+  deadLetterExchange: 'twake-space.dlx',
+  passiveExchanges: true,
+})
+```
+
 ### Unsubscribing
 
 Cancel a consumer and remove it from the auto-restoration list:
@@ -123,10 +136,21 @@ After unsubscribing, the queue will not be re-subscribed on reconnection.
 
 Incoming messages are JSON-parsed first. If that fails, the message goes straight to the DLQ (no point retrying garbage). Otherwise, your handler runs up to `maxRetries` times. Success means ack, final failure means nack to the DLQ.
 
-The handler also receives what the publisher and the broker attached to the delivery: `headers`, `timestamp`, `messageId` and `correlationId`. A handler that only needs the body can ignore it.
+A handler that knows retrying will not help throws `DeadLetterError`, and the message goes to the DLQ at once.
+
+A subscription can set its own `maxRetries`, `Infinity` included, and `maxRetryDelay`, which doubles the delay between attempts from `retryDelay` up to that cap. With `maxRetries: Infinity` a message waits unacked while, say, the database is down, and keeps its place in the queue. `close()` and a reconnect stop the retries and leave the message unacked, so the broker redelivers it.
 
 ```typescript
-await client.subscribe('events', 'order.placed', 'order-queue', async (message, { headers }) => {
+await client.subscribe('events', 'order.placed', 'order-queue', handler, {
+  maxRetries: Infinity,
+  maxRetryDelay: 60_000,
+})
+```
+
+The handler also receives where the message came from, `exchange` and `routingKey`, and what the publisher and the broker attached to the delivery: `headers`, `timestamp`, `messageId` and `correlationId`. A handler that only needs the body can ignore it.
+
+```typescript
+await client.subscribe('events', 'order.#', 'order-queue', async (message, { routingKey, headers }) => {
   // `x-death` is set by the broker on a message that went through a DLQ
   const replayed = headers['x-death'] !== undefined
 })
@@ -184,7 +208,7 @@ const client = new RabbitMQClient({
 |------|-----------|
 | `onPublish` | A message is confirmed by the broker |
 | `onMessageProcessed` | A handler completes successfully (includes duration and retry count) |
-| `onMessageDlq` | A message is nacked to the DLQ — reason is `'invalid_json'` or `'max_retries_exhausted'` |
+| `onMessageDlq` | A message is nacked to the DLQ, with reason `'invalid_json'`, `'max_retries_exhausted'` or `'dead_letter_error'` |
 | `onReconnect` | The client reconnects and re-establishes subscriptions |
 
 ## Test helpers

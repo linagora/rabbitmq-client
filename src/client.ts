@@ -26,6 +26,10 @@ const DEFAULTS = {
   closeTimeout: 5000,
 } as const
 
+function backoff(baseDelay: number, attempt: number, maxDelay: number): number {
+  return Math.min(baseDelay * Math.pow(2, attempt - 1), maxDelay)
+}
+
 /** A `mandatory` publish the broker could route to no queue. */
 export class UnroutableMessageError extends Error {
   constructor(
@@ -34,6 +38,14 @@ export class UnroutableMessageError extends Error {
   ) {
     super(`No queue is bound to receive ${exchange || '(default exchange)'}/${routingKey}`)
     this.name = 'UnroutableMessageError'
+  }
+}
+
+/** Thrown by a handler to send its message to the DLQ at once, without retrying. */
+export class DeadLetterError extends Error {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options)
+    this.name = 'DeadLetterError'
   }
 }
 
@@ -70,6 +82,7 @@ export class RabbitMQClient {
   // connection drops keep holding their permits, and the new consumer cannot
   // exceed the ceiling while the old pipeline drains. `null` = no limit.
   private subscriptionSemaphores = new Map<string, Semaphore | null>()
+  private retryWakers = new Set<() => void>()
   private inflightCount = 0
   private drainResolve: (() => void) | null = null
 
@@ -131,6 +144,8 @@ export class RabbitMQClient {
         this.logger.info('Connected to server')
         const channel = await connection.createConfirmChannel()
         this.channel = channel
+        // Retries sleeping on the replaced channel give up; the broker redelivers their messages.
+        this.wakeRetries()
         const returnWaiters = new Set<(msg: amqp.Message) => void>()
         this.returnWaiters = returnWaiters
         channel.on('return', (msg: amqp.Message) => {
@@ -304,10 +319,7 @@ export class RabbitMQClient {
           )
         }
 
-        const retryDelay = Math.min(
-          baseDelay * Math.pow(2, attempts - 1),
-          MAX_PUBLISH_RETRY_DELAY_MS,
-        )
+        const retryDelay = backoff(baseDelay, attempts, MAX_PUBLISH_RETRY_DELAY_MS)
 
         this.logger.warn('Publish attempt failed, retrying', { error, exchange, routingKey, attempt: attempts, maxAttempts, retryDelayMs: retryDelay })
 
@@ -330,6 +342,7 @@ export class RabbitMQClient {
       // A connect already running gives up after its current attempt; whatever
       // it opened is closed below.
       await Promise.allSettled([this.initializationPromise, this.reconnectionPromise])
+      this.wakeRetries()
       if (this.inflightCount > 0) {
         this.logger.info('Waiting for in-flight messages to drain', { inflightCount: this.inflightCount })
         await this.waitForDrain(this.options.closeTimeout)
@@ -434,6 +447,7 @@ export class RabbitMQClient {
     }
     const sub: RabbitMQSubscription = { exchange, routingKey, queue, handler, options }
     const existingIndex = this.subscriptions.findIndex((s) => s.queue === queue)
+    const previous = existingIndex === -1 ? undefined : this.subscriptions[existingIndex]
     if (existingIndex === -1) {
       this.subscriptions.push(sub)
     } else {
@@ -443,7 +457,15 @@ export class RabbitMQClient {
       // through setupSubscription directly and keeps the existing limiter.)
       this.subscriptionSemaphores.delete(queue)
     }
-    await this.setupSubscription(sub)
+    try {
+      await this.setupSubscription(sub)
+    } catch (error) {
+      // A subscription that cannot be set up must not be retried on every reconnect.
+      this.subscriptions = previous
+        ? this.subscriptions.map((s) => (s === sub ? previous : s))
+        : this.subscriptions.filter((s) => s !== sub)
+      throw error
+    }
   }
 
   /**
@@ -469,18 +491,25 @@ export class RabbitMQClient {
     // `this.channel`.
     const channel = this.channel
     const { exchange, routingKey, queue, handler, options } = sub
-    const dlxExchange = `${exchange}.dlx`
+    const dlxExchange = options?.deadLetterExchange ?? `${exchange}.dlx`
     const dlqQueue = `${queue}.dlq`
+    // Set once on the queue, so every binding's dead letters reach the DLQ.
     const dlqRoutingKey = `${routingKey}.dead`
+    const bindings = [{ exchange, routingKey }, ...(options?.bindings ?? [])]
 
     await channel.assertExchange(dlxExchange, 'topic', { durable: true })
     await channel.assertQueue(dlqQueue, { durable: true })
     await channel.bindQueue(dlqQueue, dlxExchange, dlqRoutingKey)
 
-    if (!this.assertedExchanges.has(exchange)) {
-      await channel.assertExchange(exchange, 'topic', { durable: true })
-      this.assertedExchanges.add(exchange)
+    const missing = bindings.map((b) => b.exchange).filter((name) => !this.assertedExchanges.has(name))
+    if (options?.passiveExchanges && missing.length > 0) {
+      await this.checkExchanges(missing)
+    } else {
+      for (const name of missing) {
+        await channel.assertExchange(name, 'topic', { durable: true })
+      }
     }
+    for (const name of missing) this.assertedExchanges.add(name)
 
     const queueType = options?.queueArguments?.['x-queue-type'] ?? 'quorum'
     const queueArgs: Record<string, unknown> = {
@@ -499,7 +528,9 @@ export class RabbitMQClient {
       arguments: { ...queueArgs, ...options?.queueArguments },
     })
 
-    await channel.bindQueue(queue, exchange, routingKey)
+    for (const binding of bindings) {
+      await channel.bindQueue(queue, binding.exchange, binding.routingKey)
+    }
     // Reuse the queue's existing limiter across reconnects; only build a new
     // one the first time (or after subscribe()/unsubscribe() cleared it).
     // A concurrency <= 0 means "no limit" (null), matching an unlimited prefetch.
@@ -512,13 +543,30 @@ export class RabbitMQClient {
       queue,
       (message) => {
         if (message) {
-          this.dispatch(message, handler, semaphore, channel)
+          this.dispatch(message, handler, semaphore, channel, options)
         }
       },
       { noAck: false },
     )
     this.consumerTags.set(queue, consumerTag)
-    this.logger.info('Subscribed to queue', { exchange, routingKey, queue })
+    this.logger.info('Subscribed to queue', { queue, bindings })
+  }
+
+  // A failed check closes the channel it ran on, so it runs on a throwaway one
+  // rather than take down the shared channel and every consumer on it.
+  private async checkExchanges(exchanges: string[]): Promise<void> {
+    if (!this.connection) {
+      throw new Error('Connection not available')
+    }
+    const probe = await this.connection.createChannel()
+    probe.on('error', () => undefined)
+    try {
+      for (const name of exchanges) {
+        await probe.checkExchange(name)
+      }
+    } finally {
+      await probe.close().catch(() => undefined)
+    }
   }
 
   /**
@@ -532,11 +580,12 @@ export class RabbitMQClient {
     handler: RabbitMQMessageHandler,
     semaphore: Semaphore | null,
     channel: amqp.ConfirmChannel,
+    options: SubscribeOptions | undefined,
   ): void {
     this.inflightCount++
     const acquire = semaphore ? semaphore.acquire() : Promise.resolve()
     acquire
-      .then(() => this.handleWithRetry(message, handler, channel))
+      .then(() => this.handleWithRetry(message, handler, channel, options))
       .catch((error) => {
         this.logger.error('Unhandled error in message handler', { error })
       })
@@ -553,6 +602,7 @@ export class RabbitMQClient {
     message: amqp.ConsumeMessage,
     handler: RabbitMQMessageHandler,
     channel: amqp.ConfirmChannel,
+    options: SubscribeOptions | undefined,
   ): Promise<void> {
     // `channel` is the one that delivered this message. If a reconnect has
     // since replaced it, this message was never acked and the broker will
@@ -588,29 +638,45 @@ export class RabbitMQClient {
     this.logger.debug('Message received, processing', { exchange, routingKey, payload: content })
 
     const properties: RabbitMQMessageProperties = {
+      exchange,
+      routingKey,
       headers: message.properties.headers ?? {},
       timestamp: message.properties.timestamp,
       messageId: message.properties.messageId,
       correlationId: message.properties.correlationId,
     }
 
-    while (attempts < this.options.maxRetries) {
+    const maxRetries = options?.maxRetries ?? this.options.maxRetries
+    while (attempts < maxRetries) {
       // Only the handler call belongs in this try. Acking inside it would make
       // a dead channel look like a failed handler and re-run its side effects.
       try {
         await handler(content, properties)
       } catch (error) {
         attempts++
+        // By name, not instanceof: the ESM and CJS builds each define their own class.
+        if (error instanceof Error && error.name === 'DeadLetterError') {
+          const duration = Date.now() - startTime
+          this.logger.warn('Handler dead-lettered the message', { error: error.message, exchange, routingKey })
+          if (this.settle(channel, message, 'nack')) {
+            this.callHook(this.hooks.onMessageDlq, { exchange, routingKey, duration, reason: 'dead_letter_error' })
+          }
+          return
+        }
         this.logger.error('Handler failed', {
           error: error instanceof Error ? error.message : error,
           stack: error instanceof Error ? error.stack : undefined,
           exchange,
           routingKey,
           attempt: attempts,
-          maxRetries: this.options.maxRetries,
+          maxRetries,
         })
-        if (attempts < this.options.maxRetries) {
-          await this.sleep(this.options.retryDelay)
+        if (attempts < maxRetries) {
+          await this.sleepUntilClose(this.retryDelayFor(attempts, options))
+          if (this.closing || channel !== this.channel) {
+            this.logger.warn('Stopped retrying a message on close or reconnect; it will be redelivered', { exchange, routingKey })
+            return
+          }
         }
         continue
       }
@@ -623,7 +689,7 @@ export class RabbitMQClient {
     }
 
     const duration = Date.now() - startTime
-    this.logger.error('Message failed after max retries, sending to DLQ', { exchange, routingKey, maxRetries: this.options.maxRetries, duration })
+    this.logger.error('Message failed after max retries, sending to DLQ', { exchange, routingKey, maxRetries, duration })
     if (this.settle(channel, message, 'nack')) {
       this.callHook(this.hooks.onMessageDlq, { exchange, routingKey, duration, reason: 'max_retries_exhausted' })
     }
@@ -714,5 +780,29 @@ export class RabbitMQClient {
 
   private sleep(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms))
+  }
+
+  private retryDelayFor(attempts: number, options: SubscribeOptions | undefined): number {
+    const { retryDelay } = this.options
+    if (options?.maxRetryDelay === undefined) return retryDelay
+    return backoff(retryDelay, attempts, options.maxRetryDelay)
+  }
+
+  private wakeRetries(): void {
+    for (const wake of [...this.retryWakers]) wake()
+  }
+
+  /** Also cut short by a reconnect, via wakeRetries(). */
+  private sleepUntilClose(ms: number): Promise<void> {
+    if (this.closing) return Promise.resolve()
+    return new Promise((resolve) => {
+      const wake = () => {
+        clearTimeout(timer)
+        this.retryWakers.delete(wake)
+        resolve()
+      }
+      const timer = setTimeout(wake, ms)
+      this.retryWakers.add(wake)
+    })
   }
 }
