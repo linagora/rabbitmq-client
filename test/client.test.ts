@@ -739,6 +739,14 @@ describe('RabbitMQClient', () => {
       expect(mockChannel.cancel).toHaveBeenCalledWith('test')
     })
 
+    it('should cancel the consumer of an exclusive queue by the queue passed', async () => {
+      const handler = vi.fn().mockResolvedValue(undefined)
+      await client.subscribe('live', '#', 'live', handler, { exclusive: true })
+      await client.unsubscribe('live')
+
+      expect(mockChannel.cancel).toHaveBeenCalledWith('test')
+    })
+
     it('should not restore unsubscribed queue on reconnect', async () => {
       const handler = vi.fn().mockResolvedValue(undefined)
       await client.subscribe('ex', 'key', 'queue', handler)
@@ -877,8 +885,7 @@ describe('RabbitMQClient', () => {
       expect(mockChannel.bindQueue).toHaveBeenCalledWith('queue', 'b2b', 'domain.user.deleted')
     })
 
-    it('should declare a broker-named exclusive queue without dead letter wiring', async () => {
-      mockChannel.assertQueue.mockResolvedValueOnce({ queue: 'amq.gen-1' })
+    it('should declare an exclusive queue under the queue name without dead letter wiring', async () => {
       const handler = vi.fn().mockResolvedValue(undefined)
       await client.subscribe('live', '#', 'live', handler, {
         exclusive: true,
@@ -886,7 +893,9 @@ describe('RabbitMQClient', () => {
       })
 
       expect(mockChannel.assertQueue).toHaveBeenCalledOnce()
-      expect(mockChannel.assertQueue).toHaveBeenCalledWith('', {
+      const [declared, options] = mockChannel.assertQueue.mock.calls[0]
+      expect(declared).toMatch(/^live\.[0-9a-f-]{36}$/)
+      expect(options).toEqual({
         exclusive: true,
         durable: false,
         autoDelete: true,
@@ -894,14 +903,14 @@ describe('RabbitMQClient', () => {
       })
       expect(mockChannel.assertExchange).not.toHaveBeenCalledWith('live.dlx', 'topic', { durable: true })
       expect(mockChannel.bindQueue).toHaveBeenCalledOnce()
-      expect(mockChannel.bindQueue).toHaveBeenCalledWith('amq.gen-1', 'live', '#')
-      expect(mockChannel.consume).toHaveBeenCalledWith('amq.gen-1', expect.any(Function), { noAck: false })
+      expect(mockChannel.bindQueue).toHaveBeenCalledWith(declared, 'live', '#')
+      expect(mockChannel.consume).toHaveBeenCalledWith(declared, expect.any(Function), { noAck: false })
     })
 
-    it('should declare a new exclusive queue after reconnection', async () => {
-      mockChannel.assertQueue.mockResolvedValueOnce({ queue: 'amq.gen-1' })
+    it('should declare an exclusive queue under a new name after reconnection', async () => {
       const handler = vi.fn().mockResolvedValue(undefined)
       await client.subscribe('live', '#', 'live', handler, { exclusive: true })
+      const [first] = mockChannel.assertQueue.mock.calls[0]
 
       const closeHandler = mockConnection.on.mock.calls.find(
         (call: unknown[]) => call[0] === 'close',
@@ -909,12 +918,19 @@ describe('RabbitMQClient', () => {
 
       mockChannel.assertQueue.mockClear()
       mockChannel.bindQueue.mockClear()
-      mockChannel.assertQueue.mockResolvedValueOnce({ queue: 'amq.gen-2' })
       closeHandler()
       await vi.advanceTimersByTimeAsync(200)
 
-      expect(mockChannel.assertQueue).toHaveBeenCalledWith('', expect.objectContaining({ exclusive: true }))
-      expect(mockChannel.bindQueue).toHaveBeenCalledWith('amq.gen-2', 'live', '#')
+      const [second, options] = mockChannel.assertQueue.mock.calls[0]
+      expect(second).toMatch(/^live\.[0-9a-f-]{36}$/)
+      expect(second).not.toBe(first)
+      expect(options).toMatchObject({
+        exclusive: true,
+        durable: false,
+        autoDelete: true,
+        arguments: { 'x-queue-type': 'classic' },
+      })
+      expect(mockChannel.bindQueue).toHaveBeenCalledWith(second, 'live', '#')
     })
 
     it('should drop a failed message of an exclusive queue without the DLQ hook', async () => {

@@ -64,9 +64,9 @@ export interface SubscribeOptions {
   maxRetryDelay?: number
   /**
    * A queue for this connection only, for fanning messages out to every
-   * consumer: classic, not durable, named by the broker, deleted when the
-   * connection closes or the consumer is cancelled, and declared anew on
-   * reconnection. The `queue` argument only names the subscription. It has no
+   * consumer: classic, not durable, named `<queue>.<uuid>`, deleted when the
+   * connection closes or the consumer is cancelled, and declared under a new
+   * name on reconnection. `queue` also names the subscription. It has no
    * DLQ, so `deadLetterExchange` is ignored and a message its handler fails is
    * dropped. Set `x-max-length` in `queueArguments` to bound it.
    */

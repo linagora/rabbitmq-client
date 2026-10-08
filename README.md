@@ -122,7 +122,7 @@ await client.subscribe('space', 'twake.space.#', 'twake-space', handler, {
 })
 ```
 
-To deliver every message to every instance of a service, subscribe with `exclusive`. Each instance gets its own queue, named by the broker, which deletes it when the connection closes or the consumer is cancelled. The client declares a new one on reconnection, and the `queue` argument only names the subscription for `unsubscribe`. It has no DLQ: a message the handler fails is dropped, and so are messages published or in flight while the instance is disconnected. Nothing bounds it unless you set `x-max-length`.
+To deliver every message to every instance of a service, subscribe with `exclusive`. Each instance gets its own queue, named `<queue>.<uuid>`, which the broker deletes when the connection closes or the consumer is cancelled. The client declares one under a new name on reconnection, and `unsubscribe` takes the `queue` you passed. A permission pattern that matches `<queue>.` followed by anything covers it, such as `^live(\..*)?$`; an exact `^live$` does not. It has no DLQ: a message the handler fails is dropped, and so are messages published or in flight while the instance is disconnected. Nothing bounds it unless you set `x-max-length`.
 
 ```typescript
 await client.subscribe('live', '#', 'live', handler, {
