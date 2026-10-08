@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto'
 import amqp from 'amqplib'
 import type {
   ILogger,
@@ -521,15 +522,17 @@ export class RabbitMQClient {
 
     let declared = queue
     if (options?.exclusive) {
-      // Named by the broker: after a network drop it may still hold the old
-      // connection's queue, and declaring that name again would be refused.
+      // A new name per connection: after a network drop the broker may still
+      // hold the old queue and refuse its name. Prefixed with `queue`, not
+      // broker-named, so permissions scoped to the service's names cover it.
       // A quorum queue cannot be exclusive.
-      declared = (await channel.assertQueue('', {
+      declared = `${queue}.${randomUUID()}`
+      await channel.assertQueue(declared, {
         exclusive: true,
         durable: false,
         autoDelete: true,
         arguments: { ...options.queueArguments, 'x-queue-type': 'classic' },
-      })).queue
+      })
     } else {
       const queueType = options?.queueArguments?.['x-queue-type'] ?? 'quorum'
       const queueArgs: Record<string, unknown> = {
@@ -570,7 +573,7 @@ export class RabbitMQClient {
       { noAck: false },
     )
     this.consumerTags.set(queue, consumerTag)
-    this.logger.info('Subscribed to queue', { queue, bindings })
+    this.logger.info('Subscribed to queue', { queue: declared, bindings })
   }
 
   // A failed check closes the channel it ran on, so it runs on a throwaway one
