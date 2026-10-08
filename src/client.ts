@@ -26,6 +26,10 @@ const DEFAULTS = {
   closeTimeout: 5000,
 } as const
 
+function rejecting(options: SubscribeOptions | undefined): string {
+  return options?.exclusive ? 'dropping it' : 'sending to DLQ'
+}
+
 function backoff(baseDelay: number, attempt: number, maxDelay: number): number {
   return Math.min(baseDelay * Math.pow(2, attempt - 1), maxDelay)
 }
@@ -497,9 +501,11 @@ export class RabbitMQClient {
     const dlqRoutingKey = `${routingKey}.dead`
     const bindings = [{ exchange, routingKey }, ...(options?.bindings ?? [])]
 
-    await channel.assertExchange(dlxExchange, 'topic', { durable: true })
-    await channel.assertQueue(dlqQueue, { durable: true })
-    await channel.bindQueue(dlqQueue, dlxExchange, dlqRoutingKey)
+    if (!options?.exclusive) {
+      await channel.assertExchange(dlxExchange, 'topic', { durable: true })
+      await channel.assertQueue(dlqQueue, { durable: true })
+      await channel.bindQueue(dlqQueue, dlxExchange, dlqRoutingKey)
+    }
 
     const passive = options?.passiveExchanges
     const isPassive = (name: string) => passive === true || (Array.isArray(passive) && passive.includes(name))
@@ -513,25 +519,38 @@ export class RabbitMQClient {
     }
     for (const name of missing) this.assertedExchanges.add(name)
 
-    const queueType = options?.queueArguments?.['x-queue-type'] ?? 'quorum'
-    const queueArgs: Record<string, unknown> = {
-      'x-queue-type': queueType,
-      'x-overflow': 'reject-publish',
-    }
-    // at-least-once DLQ strategy is only supported by quorum queues
-    if (queueType === 'quorum') {
-      queueArgs['x-dead-letter-strategy'] = 'at-least-once'
-    }
+    let declared = queue
+    if (options?.exclusive) {
+      // Named by the broker: after a network drop it may still hold the old
+      // connection's queue, and declaring that name again would be refused.
+      // A quorum queue cannot be exclusive.
+      declared = (await channel.assertQueue('', {
+        exclusive: true,
+        durable: false,
+        autoDelete: true,
+        arguments: { ...options.queueArguments, 'x-queue-type': 'classic' },
+      })).queue
+    } else {
+      const queueType = options?.queueArguments?.['x-queue-type'] ?? 'quorum'
+      const queueArgs: Record<string, unknown> = {
+        'x-queue-type': queueType,
+        'x-overflow': 'reject-publish',
+      }
+      // at-least-once DLQ strategy is only supported by quorum queues
+      if (queueType === 'quorum') {
+        queueArgs['x-dead-letter-strategy'] = 'at-least-once'
+      }
 
-    await channel.assertQueue(queue, {
-      durable: true,
-      deadLetterExchange: dlxExchange,
-      deadLetterRoutingKey: dlqRoutingKey,
-      arguments: { ...queueArgs, ...options?.queueArguments },
-    })
+      await channel.assertQueue(queue, {
+        durable: true,
+        deadLetterExchange: dlxExchange,
+        deadLetterRoutingKey: dlqRoutingKey,
+        arguments: { ...queueArgs, ...options?.queueArguments },
+      })
+    }
 
     for (const binding of bindings) {
-      await channel.bindQueue(queue, binding.exchange, binding.routingKey)
+      await channel.bindQueue(declared, binding.exchange, binding.routingKey)
     }
     // Reuse the queue's existing limiter across reconnects; only build a new
     // one the first time (or after subscribe()/unsubscribe() cleared it).
@@ -542,7 +561,7 @@ export class RabbitMQClient {
     }
     const semaphore = this.subscriptionSemaphores.get(queue) ?? null
     const { consumerTag } = await channel.consume(
-      queue,
+      declared,
       (message) => {
         if (message) {
           this.dispatch(message, handler, semaphore, channel, options)
@@ -625,15 +644,13 @@ export class RabbitMQClient {
     } catch (parseError) {
       const rawContent = message.content.toString()
       const rawPreview = rawContent.substring(0, 100)
-      this.logger.error('Failed to parse message JSON, sending to DLQ', {
+      this.logger.error(`Failed to parse message JSON, ${rejecting(options)}`, {
         error: parseError,
         exchange,
         routingKey,
         rawContentPreview: rawPreview + (rawContent.length > 100 ? '...' : ''),
       })
-      if (this.settle(channel, message, 'nack')) {
-        this.callHook(this.hooks.onMessageDlq, { exchange, routingKey, duration: 0, reason: 'invalid_json' })
-      }
+      this.reject(channel, message, options, { exchange, routingKey, duration: 0, reason: 'invalid_json' })
       return
     }
 
@@ -659,10 +676,8 @@ export class RabbitMQClient {
         // By name, not instanceof: the ESM and CJS builds each define their own class.
         if (error instanceof Error && error.name === 'DeadLetterError') {
           const duration = Date.now() - startTime
-          this.logger.warn('Handler dead-lettered the message', { error: error.message, exchange, routingKey })
-          if (this.settle(channel, message, 'nack')) {
-            this.callHook(this.hooks.onMessageDlq, { exchange, routingKey, duration, reason: 'dead_letter_error' })
-          }
+          this.logger.warn(`Handler dead-lettered the message, ${rejecting(options)}`, { error: error.message, exchange, routingKey })
+          this.reject(channel, message, options, { exchange, routingKey, duration, reason: 'dead_letter_error' })
           return
         }
         this.logger.error('Handler failed', {
@@ -676,7 +691,10 @@ export class RabbitMQClient {
         if (attempts < maxRetries) {
           await this.sleepUntilClose(this.retryDelayFor(attempts, options))
           if (this.closing || channel !== this.channel) {
-            this.logger.warn('Stopped retrying a message on close or reconnect; it will be redelivered', { exchange, routingKey })
+            this.logger.warn(
+              `Stopped retrying a message on close or reconnect; ${options?.exclusive ? 'it is lost with its queue' : 'it will be redelivered'}`,
+              { exchange, routingKey },
+            )
             return
           }
         }
@@ -691,9 +709,19 @@ export class RabbitMQClient {
     }
 
     const duration = Date.now() - startTime
-    this.logger.error('Message failed after max retries, sending to DLQ', { exchange, routingKey, maxRetries, duration })
-    if (this.settle(channel, message, 'nack')) {
-      this.callHook(this.hooks.onMessageDlq, { exchange, routingKey, duration, reason: 'max_retries_exhausted' })
+    this.logger.error(`Message failed after max retries, ${rejecting(options)}`, { exchange, routingKey, maxRetries, duration })
+    this.reject(channel, message, options, { exchange, routingKey, duration, reason: 'max_retries_exhausted' })
+  }
+
+  // An exclusive queue has no DLQ: the nack drops the message.
+  private reject(
+    channel: amqp.ConfirmChannel,
+    message: amqp.ConsumeMessage,
+    options: SubscribeOptions | undefined,
+    info: Parameters<NonNullable<RabbitMQHooks['onMessageDlq']>>[0],
+  ): void {
+    if (this.settle(channel, message, 'nack') && !options?.exclusive) {
+      this.callHook(this.hooks.onMessageDlq, info)
     }
   }
 
