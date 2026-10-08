@@ -877,6 +877,43 @@ describe('RabbitMQClient', () => {
       expect(mockChannel.bindQueue).toHaveBeenCalledWith('queue', 'b2b', 'domain.user.deleted')
     })
 
+    it('should declare an exclusive queue without dead letter wiring', async () => {
+      const handler = vi.fn().mockResolvedValue(undefined)
+      await client.subscribe('live', '#', 'live.replica-1', handler, {
+        exclusive: true,
+      })
+
+      expect(mockChannel.assertQueue).toHaveBeenCalledOnce()
+      expect(mockChannel.assertQueue).toHaveBeenCalledWith('live.replica-1', {
+        exclusive: true,
+        durable: false,
+        autoDelete: true,
+        arguments: { 'x-queue-type': 'classic' },
+      })
+      expect(mockChannel.assertExchange).not.toHaveBeenCalledWith('live.dlx', 'topic', { durable: true })
+      expect(mockChannel.bindQueue).toHaveBeenCalledOnce()
+      expect(mockChannel.bindQueue).toHaveBeenCalledWith('live.replica-1', 'live', '#')
+    })
+
+    it('should declare an exclusive queue again after reconnection', async () => {
+      const handler = vi.fn().mockResolvedValue(undefined)
+      await client.subscribe('live', '#', 'live.replica-1', handler, {
+        exclusive: true,
+      })
+
+      const closeHandler = mockConnection.on.mock.calls.find(
+        (call: unknown[]) => call[0] === 'close',
+      )![1] as () => void
+
+      mockChannel.assertQueue.mockClear()
+      closeHandler()
+      await vi.advanceTimersByTimeAsync(200)
+
+      expect(mockChannel.assertQueue).toHaveBeenCalledWith('live.replica-1', expect.objectContaining({
+        exclusive: true,
+      }))
+    })
+
     it('should preserve custom options across reconnection', async () => {
       const handler = vi.fn().mockResolvedValue(undefined)
       await client.subscribe('ex', 'key', 'queue', handler, {

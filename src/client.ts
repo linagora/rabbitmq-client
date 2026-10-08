@@ -497,9 +497,11 @@ export class RabbitMQClient {
     const dlqRoutingKey = `${routingKey}.dead`
     const bindings = [{ exchange, routingKey }, ...(options?.bindings ?? [])]
 
-    await channel.assertExchange(dlxExchange, 'topic', { durable: true })
-    await channel.assertQueue(dlqQueue, { durable: true })
-    await channel.bindQueue(dlqQueue, dlxExchange, dlqRoutingKey)
+    if (!options?.exclusive) {
+      await channel.assertExchange(dlxExchange, 'topic', { durable: true })
+      await channel.assertQueue(dlqQueue, { durable: true })
+      await channel.bindQueue(dlqQueue, dlxExchange, dlqRoutingKey)
+    }
 
     const passive = options?.passiveExchanges
     const isPassive = (name: string) => passive === true || (Array.isArray(passive) && passive.includes(name))
@@ -513,22 +515,32 @@ export class RabbitMQClient {
     }
     for (const name of missing) this.assertedExchanges.add(name)
 
-    const queueType = options?.queueArguments?.['x-queue-type'] ?? 'quorum'
-    const queueArgs: Record<string, unknown> = {
-      'x-queue-type': queueType,
-      'x-overflow': 'reject-publish',
-    }
-    // at-least-once DLQ strategy is only supported by quorum queues
-    if (queueType === 'quorum') {
-      queueArgs['x-dead-letter-strategy'] = 'at-least-once'
-    }
+    if (options?.exclusive) {
+      // A quorum queue cannot be exclusive.
+      await channel.assertQueue(queue, {
+        exclusive: true,
+        durable: false,
+        autoDelete: true,
+        arguments: { 'x-queue-type': 'classic', ...options.queueArguments },
+      })
+    } else {
+      const queueType = options?.queueArguments?.['x-queue-type'] ?? 'quorum'
+      const queueArgs: Record<string, unknown> = {
+        'x-queue-type': queueType,
+        'x-overflow': 'reject-publish',
+      }
+      // at-least-once DLQ strategy is only supported by quorum queues
+      if (queueType === 'quorum') {
+        queueArgs['x-dead-letter-strategy'] = 'at-least-once'
+      }
 
-    await channel.assertQueue(queue, {
-      durable: true,
-      deadLetterExchange: dlxExchange,
-      deadLetterRoutingKey: dlqRoutingKey,
-      arguments: { ...queueArgs, ...options?.queueArguments },
-    })
+      await channel.assertQueue(queue, {
+        durable: true,
+        deadLetterExchange: dlxExchange,
+        deadLetterRoutingKey: dlqRoutingKey,
+        arguments: { ...queueArgs, ...options?.queueArguments },
+      })
+    }
 
     for (const binding of bindings) {
       await channel.bindQueue(queue, binding.exchange, binding.routingKey)

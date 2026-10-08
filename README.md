@@ -122,6 +122,14 @@ await client.subscribe('space', 'twake.space.#', 'twake-space', handler, {
 })
 ```
 
+To deliver every message to every instance of a service, give each instance its own `exclusive` queue. The broker deletes it when the connection closes, and the client declares it again on reconnection. It has no DLQ: a message the handler fails is dropped. Messages published while the instance is disconnected are lost.
+
+```typescript
+await client.subscribe('live', '#', `live.${randomUUID()}`, handler, {
+  exclusive: true,
+})
+```
+
 ### Unsubscribing
 
 Cancel a consumer and remove it from the auto-restoration list:

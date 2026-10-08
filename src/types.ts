@@ -62,6 +62,13 @@ export interface SubscribeOptions {
    * many ms. Without it the delay stays at `retryDelay`.
    */
   maxRetryDelay?: number
+  /**
+   * A queue for this connection only, for fanning messages out to every
+   * consumer: classic, not durable, deleted by the broker when the connection
+   * closes and declared again on reconnection. Each consumer passes its own
+   * queue name. It has no DLQ, so a message its handler fails is dropped.
+   */
+  exclusive?: boolean
 }
 
 /** An exchange and routing key a queue is bound to */
