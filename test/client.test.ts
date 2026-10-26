@@ -902,6 +902,34 @@ describe('RabbitMQClient', () => {
       // No subscriptions to restore
       expect(mockChannel.consume).not.toHaveBeenCalled()
     })
+
+    it('should re-subscribe when the broker cancels the consumer', async () => {
+      const deliver = setupConsumeCapture()
+      await client.init()
+      await client.subscribe('ex', 'key', 'queue', vi.fn())
+      mockChannel.consume.mockClear()
+
+      deliver(null)
+      await vi.advanceTimersByTimeAsync(0)
+      expect(mockChannel.consume).not.toHaveBeenCalled()
+
+      await vi.advanceTimersByTimeAsync(10)
+      expect(mockChannel.consume).toHaveBeenCalledOnce()
+      expect(mockChannel.consume.mock.calls[0][0]).toBe('queue')
+    })
+
+    it('should not cancel a consumer the broker already cancelled', async () => {
+      const deliver = setupConsumeCapture()
+      await client.init()
+      await client.subscribe('ex', 'key', 'queue', vi.fn())
+
+      deliver(null)
+      await client.unsubscribe('queue')
+      await vi.advanceTimersByTimeAsync(1000)
+
+      expect(mockChannel.cancel).not.toHaveBeenCalled()
+      expect(mockChannel.consume).toHaveBeenCalledOnce()
+    })
   })
 
   describe('unsubscribe()', () => {

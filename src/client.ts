@@ -608,7 +608,12 @@ export class RabbitMQClient {
       (message) => {
         if (message) {
           this.dispatch(message, handler, semaphore, channel, options)
+          return
         }
+        // amqplib passes null when the broker cancels the consumer, e.g. when the queue is deleted.
+        this.logger.warn('Broker cancelled the consumer', { queue: declared })
+        if (this.consumerTags.get(queue) === consumerTag) this.consumerTags.delete(queue)
+        this.retrySubscription(sub, channel).catch(() => undefined)
       },
       { noAck: false },
     )
