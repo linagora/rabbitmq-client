@@ -344,16 +344,22 @@ export class RabbitMQClient {
     // reconnect and leave a connection behind that keeps the process alive.
     this.closing = true
     try {
+      // Woken before the wait below, so a reconnect sleeping between attempts
+      // does not hold close() for its whole backoff.
+      this.wakeRetries()
       // A connect already running gives up after its current attempt; whatever
       // it opened is closed below.
       await Promise.allSettled([this.initializationPromise, this.reconnectionPromise])
-      this.wakeRetries()
       if (this.inflightCount > 0) {
         this.logger.info('Waiting for in-flight messages to drain', { inflightCount: this.inflightCount })
         await this.waitForDrain(this.options.closeTimeout)
       }
       try {
-        await this.channel?.close()
+        // A channel lost without a completed reconnect is already closed, and
+        // amqplib throws when closing it again.
+        await this.channel?.close().catch((error: unknown) => {
+          if (this.connected) throw error
+        })
       } finally {
         await this.connection?.close()
       }
@@ -380,7 +386,9 @@ export class RabbitMQClient {
   private async reconnectWithRetry(): Promise<void> {
     if (this.closing) return
     if (this.reconnectionPromise) {
-      return this.reconnectionPromise
+      return this.reconnectionPromise.catch((error) => {
+        if (!this.closing) throw error
+      })
     }
     this.connected = false
     this.logger.info('Starting reconnection...')
@@ -398,8 +406,16 @@ export class RabbitMQClient {
   }
 
   private async doReconnect(): Promise<void> {
-    await this.doConnect()
-    await this.resubscribeAll()
+    for (let attempt = 1; ; attempt++) {
+      await this.doConnect()
+      await this.resubscribeAll()
+      // A channel that failed during resubscribeAll joined this reconnect
+      // instead of starting its own, so nothing else will replace it.
+      if (this.connected || this.closing) return
+      const retryDelay = backoff(this.options.connectionRetryDelay, attempt, MAX_BACKOFF_MS)
+      this.logger.warn('Channel lost while restoring subscriptions, reconnecting again', { attempt, retryDelayMs: retryDelay })
+      await this.sleepUntilClose(retryDelay)
+    }
   }
 
   private async resubscribeAll(): Promise<void> {
@@ -433,7 +449,10 @@ export class RabbitMQClient {
     if (failed.length > 0) {
       this.logger.warn('Some subscriptions failed to restore', { count: failed.length, queues: failed })
     }
-    this.callHook(this.hooks.onReconnect, { subscriptionsRestored: succeeded.length, subscriptionsFailed: failed.length })
+    // A restore whose channel died is retried by doReconnect, so it is not a reconnect yet.
+    if (this.connected) {
+      this.callHook(this.hooks.onReconnect, { subscriptionsRestored: succeeded.length, subscriptionsFailed: failed.length })
+    }
   }
 
   // A reconnect restores every subscription on its new channel, so a retry
