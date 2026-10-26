@@ -15,7 +15,7 @@ import { defaultLogger, forLibraryCalls } from './logger.js'
 import { Semaphore } from './semaphore.js'
 
 const DEFAULT_PREFETCH = 10
-const MAX_PUBLISH_RETRY_DELAY_MS = 60_000
+const MAX_BACKOFF_MS = 60_000
 
 const DEFAULTS = {
   maxRetries: 3,
@@ -324,7 +324,7 @@ export class RabbitMQClient {
           )
         }
 
-        const retryDelay = backoff(baseDelay, attempts, MAX_PUBLISH_RETRY_DELAY_MS)
+        const retryDelay = backoff(baseDelay, attempts, MAX_BACKOFF_MS)
 
         this.logger.warn('Publish attempt failed, retrying', { error, exchange, routingKey, attempt: attempts, maxAttempts, retryDelayMs: retryDelay })
 
@@ -403,7 +403,8 @@ export class RabbitMQClient {
   }
 
   private async resubscribeAll(): Promise<void> {
-    if (this.subscriptions.length === 0) {
+    const channel = this.channel
+    if (this.subscriptions.length === 0 || !channel) {
       return
     }
     this.logger.info('Re-establishing subscriptions', { count: this.subscriptions.length })
@@ -423,6 +424,7 @@ export class RabbitMQClient {
         const queue = subs[index].queue
         failed.push(queue)
         this.logger.error('Failed to re-subscribe to queue', { error: result.reason, queue })
+        this.retrySubscription(subs[index], channel).catch(() => undefined)
       }
     })
     if (succeeded.length > 0) {
@@ -432,6 +434,25 @@ export class RabbitMQClient {
       this.logger.warn('Some subscriptions failed to restore', { count: failed.length, queues: failed })
     }
     this.callHook(this.hooks.onReconnect, { subscriptionsRestored: succeeded.length, subscriptionsFailed: failed.length })
+  }
+
+  // A reconnect restores every subscription on its new channel, so a retry
+  // bound to the old channel stops rather than racing it.
+  private async retrySubscription(sub: RabbitMQSubscription, channel: amqp.ConfirmChannel): Promise<void> {
+    const stale = () => this.closing || channel !== this.channel || !this.subscriptions.includes(sub)
+    for (let attempt = 1; !stale(); attempt++) {
+      const retryDelay = backoff(this.options.connectionRetryDelay, attempt, MAX_BACKOFF_MS)
+      this.logger.warn('Retrying subscription', { queue: sub.queue, attempt, retryDelayMs: retryDelay })
+      await this.sleepUntilClose(retryDelay)
+      if (stale()) return
+      try {
+        await this.setupSubscription(sub)
+        this.logger.info('Restored subscription after retries', { queue: sub.queue, attempts: attempt })
+        return
+      } catch (error) {
+        this.logger.error('Failed to re-subscribe to queue', { error, queue: sub.queue, attempt })
+      }
+    }
   }
 
   /**
@@ -572,6 +593,16 @@ export class RabbitMQClient {
       },
       { noAck: false },
     )
+    // unsubscribe() or a newer subscribe() ran while this consumer was being set up.
+    if (!this.subscriptions.includes(sub)) {
+      // The limiter this call built would outlive the subscription and be
+      // reused by a later subscribe() to the same queue.
+      if (!this.subscriptions.some((s) => s.queue === queue)) {
+        this.subscriptionSemaphores.delete(queue)
+      }
+      await channel.cancel(consumerTag).catch(() => undefined)
+      return
+    }
     this.consumerTags.set(queue, consumerTag)
     this.logger.info('Subscribed to queue', { queue: declared, bindings })
   }
