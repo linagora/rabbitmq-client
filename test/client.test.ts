@@ -648,6 +648,102 @@ describe('RabbitMQClient', () => {
       expect(client.isConnected()).toBe(true)
     })
 
+    it('should retry a subscription that fails to restore until it succeeds', async () => {
+      await client.init()
+      await client.subscribe('ex', 'key', 'queue', vi.fn())
+      const closeHandler = mockConnection.on.mock.calls.find(
+        (call: unknown[]) => call[0] === 'close',
+      )![1] as () => void
+      mockChannel.consume.mockClear()
+      mockChannel.consume
+        .mockRejectedValueOnce(new Error('NOT_FOUND'))
+        .mockRejectedValueOnce(new Error('NOT_FOUND'))
+
+      closeHandler()
+      await vi.advanceTimersByTimeAsync(0)
+      expect(mockChannel.consume).toHaveBeenCalledTimes(1)
+
+      // connectionRetryDelay is 10 ms, doubled on each attempt.
+      await vi.advanceTimersByTimeAsync(10)
+      expect(mockChannel.consume).toHaveBeenCalledTimes(2)
+      await vi.advanceTimersByTimeAsync(20)
+      expect(mockChannel.consume).toHaveBeenCalledTimes(3)
+
+      await vi.advanceTimersByTimeAsync(1000)
+      expect(mockChannel.consume).toHaveBeenCalledTimes(3)
+    })
+
+    it('should stop retrying a subscription once it is unsubscribed', async () => {
+      await client.init()
+      await client.subscribe('ex', 'key', 'queue', vi.fn())
+      const closeHandler = mockConnection.on.mock.calls.find(
+        (call: unknown[]) => call[0] === 'close',
+      )![1] as () => void
+      mockChannel.consume.mockClear()
+      mockChannel.consume.mockRejectedValue(new Error('NOT_FOUND'))
+
+      closeHandler()
+      await vi.advanceTimersByTimeAsync(0)
+      await client.unsubscribe('queue')
+      await vi.advanceTimersByTimeAsync(1000)
+
+      expect(mockChannel.consume).toHaveBeenCalledTimes(1)
+    })
+
+    it('should stop retrying a subscription on close', async () => {
+      await client.init()
+      await client.subscribe('ex', 'key', 'queue', vi.fn())
+      const closeHandler = mockConnection.on.mock.calls.find(
+        (call: unknown[]) => call[0] === 'close',
+      )![1] as () => void
+      mockChannel.consume.mockClear()
+      mockChannel.consume.mockRejectedValue(new Error('NOT_FOUND'))
+
+      closeHandler()
+      await vi.advanceTimersByTimeAsync(0)
+      await client.close(false)
+      await vi.advanceTimersByTimeAsync(1000)
+
+      expect(mockChannel.consume).toHaveBeenCalledTimes(1)
+    })
+
+    it('should stop retrying a subscription once a reconnect replaces its channel', async () => {
+      await client.init()
+      await client.subscribe('ex', 'key', 'queue', vi.fn())
+      const closeHandler = mockConnection.on.mock.calls.find(
+        (call: unknown[]) => call[0] === 'close',
+      )![1] as () => void
+      mockChannel.consume.mockClear()
+      mockChannel.consume.mockRejectedValueOnce(new Error('NOT_FOUND'))
+
+      closeHandler()
+      await vi.advanceTimersByTimeAsync(0)
+      expect(mockChannel.consume).toHaveBeenCalledTimes(1)
+
+      mockConnection.createConfirmChannel.mockResolvedValueOnce({ ...mockChannel })
+      closeHandler()
+      await vi.advanceTimersByTimeAsync(1000)
+
+      expect(mockChannel.consume).toHaveBeenCalledTimes(2)
+    })
+
+    it('should cancel a consumer restored for a queue unsubscribed meanwhile', async () => {
+      await client.init()
+      await client.subscribe('ex', 'key', 'queue', vi.fn())
+      const closeHandler = mockConnection.on.mock.calls.find(
+        (call: unknown[]) => call[0] === 'close',
+      )![1] as () => void
+      mockChannel.consume.mockImplementationOnce((async () => {
+        await client.unsubscribe('queue')
+        return { consumerTag: 'late' }
+      }) as typeof mockChannel.consume)
+
+      closeHandler()
+      await vi.advanceTimersByTimeAsync(1000)
+
+      expect(mockChannel.cancel).toHaveBeenCalledWith('late')
+    })
+
     it('should reconnect on channel error', async () => {
       await client.init()
 

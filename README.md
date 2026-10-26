@@ -167,7 +167,7 @@ await client.subscribe('events', 'order.#', 'order-queue', async (message, { rou
 
 ### Reconnection
 
-If the connection or channel drops, the client reconnects and re-subscribes to everything automatically. Multiple reconnection triggers (e.g. connection close + channel close firing at the same time) are collapsed into a single attempt.
+If the connection or channel drops, the client reconnects and re-subscribes to everything automatically. Multiple reconnection triggers (e.g. connection close + channel close firing at the same time) are collapsed into a single attempt. A subscription that fails to restore is retried on its own, starting at `connectionRetryDelay` and doubling up to 60 seconds, until it succeeds, is unsubscribed, or the client closes.
 
 ### Graceful shutdown
 
