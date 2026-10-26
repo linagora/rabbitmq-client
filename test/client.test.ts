@@ -776,6 +776,88 @@ describe('RabbitMQClient', () => {
       expect(client.isConnected()).toBe(true)
     })
 
+    it('should reconnect again when the channel fails while subscriptions are being restored', async () => {
+      await client.init()
+      await client.subscribe('ex', 'key', 'queue', vi.fn())
+      const connectionCloseHandler = mockConnection.on.mock.calls.find(
+        (call: unknown[]) => call[0] === 'close',
+      )![1] as () => void
+      const channelCloseHandler = mockChannel.on.mock.calls.find(
+        (call: unknown[]) => call[0] === 'close',
+      )![1] as () => void
+      vi.mocked(amqp.connect).mockClear()
+      mockChannel.consume.mockClear()
+      mockChannel.consume.mockImplementationOnce((() => {
+        channelCloseHandler()
+        return Promise.reject(new Error('Channel ended, no reply will be forthcoming'))
+      }) as typeof mockChannel.consume)
+
+      connectionCloseHandler()
+      await vi.advanceTimersByTimeAsync(0)
+      expect(client.isConnected()).toBe(false)
+
+      await vi.advanceTimersByTimeAsync(10)
+      expect(amqp.connect).toHaveBeenCalledTimes(2)
+      expect(client.isConnected()).toBe(true)
+    })
+
+    it('should back off between reconnects while the channel keeps failing during restore', async () => {
+      await client.init()
+      await client.subscribe('ex', 'key', 'queue', vi.fn())
+      const connectionCloseHandler = mockConnection.on.mock.calls.find(
+        (call: unknown[]) => call[0] === 'close',
+      )![1] as () => void
+      const channelCloseHandler = mockChannel.on.mock.calls.find(
+        (call: unknown[]) => call[0] === 'close',
+      )![1] as () => void
+      vi.mocked(amqp.connect).mockClear()
+      mockChannel.consume.mockImplementation((() => {
+        channelCloseHandler()
+        return Promise.reject(new Error('Channel ended, no reply will be forthcoming'))
+      }) as typeof mockChannel.consume)
+
+      connectionCloseHandler()
+      await vi.advanceTimersByTimeAsync(0)
+      expect(amqp.connect).toHaveBeenCalledTimes(1)
+
+      // connectionRetryDelay is 10 ms, doubled on each attempt.
+      await vi.advanceTimersByTimeAsync(10)
+      expect(amqp.connect).toHaveBeenCalledTimes(2)
+      await vi.advanceTimersByTimeAsync(20)
+      expect(amqp.connect).toHaveBeenCalledTimes(3)
+      await vi.advanceTimersByTimeAsync(39)
+      expect(amqp.connect).toHaveBeenCalledTimes(3)
+      await vi.advanceTimersByTimeAsync(1)
+      expect(amqp.connect).toHaveBeenCalledTimes(4)
+
+      await client.close()
+    })
+
+    it('should stop reconnecting at once when closed between attempts', async () => {
+      await client.init()
+      await client.subscribe('ex', 'key', 'queue', vi.fn())
+      const connectionCloseHandler = mockConnection.on.mock.calls.find(
+        (call: unknown[]) => call[0] === 'close',
+      )![1] as () => void
+      const channelCloseHandler = mockChannel.on.mock.calls.find(
+        (call: unknown[]) => call[0] === 'close',
+      )![1] as () => void
+      vi.mocked(amqp.connect).mockClear()
+      mockChannel.consume.mockImplementationOnce((() => {
+        channelCloseHandler()
+        return Promise.reject(new Error('Channel ended, no reply will be forthcoming'))
+      }) as typeof mockChannel.consume)
+
+      connectionCloseHandler()
+      await vi.advanceTimersByTimeAsync(0)
+      mockChannel.close.mockRejectedValueOnce(new Error('Channel closed'))
+      // Resolves without advancing the timers, so it did not wait for the backoff.
+      await client.close()
+      await vi.advanceTimersByTimeAsync(1000)
+
+      expect(amqp.connect).toHaveBeenCalledOnce()
+    })
+
     it('should preserve subscriptions across close(false) and re-init', async () => {
       const handler = vi.fn().mockResolvedValue(undefined)
       await client.init()
