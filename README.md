@@ -60,6 +60,13 @@ await client.publish('auth', 'user.created', { userId: '123' }, {
 })
 ```
 
+`userId` sets the AMQP `user-id` property. RabbitMQ refuses the message, and closes the channel, unless it is the user the client connected as, so a consumer can trust it to say which broker user published the message.
+
+```typescript
+// Connected as amqp://tasks:secret@rabbitmq:5672
+await client.publish('activity', 'task.created', { taskId: '42' }, { userId: 'tasks' })
+```
+
 To reach one queue directly, publish to the default exchange (`''`) with the queue name as the routing key. The client does not declare the default exchange, since it always exists.
 
 ```typescript
@@ -156,7 +163,7 @@ await client.subscribe('events', 'order.placed', 'order-queue', handler, {
 })
 ```
 
-The handler also receives where the message came from, `exchange` and `routingKey`, and what the publisher and the broker attached to the delivery: `headers`, `timestamp`, `messageId` and `correlationId`. A handler that only needs the body can ignore it.
+The handler also receives where the message came from, `exchange` and `routingKey`, and what the publisher and the broker attached to the delivery: `headers`, `timestamp`, `messageId`, `correlationId` and `userId`. A handler that only needs the body can ignore it. `userId` is the AMQP `user-id` the publisher set, if any; the broker checks it against the publishing connection, so it can be trusted to name the broker user that published the message.
 
 ```typescript
 await client.subscribe('events', 'order.#', 'order-queue', async (message, { routingKey, headers }) => {

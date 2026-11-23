@@ -273,6 +273,28 @@ describe('RabbitMQClient', () => {
       expect(mockChannel.waitForConfirms).toHaveBeenCalledOnce()
     })
 
+    it('should pass the AMQP properties set in the options', async () => {
+      vi.setSystemTime(1757000000500)
+      await client.publish('test-exchange', 'test.key', { foo: 'bar' }, {
+        headers: { 'x-trace-id': 't-1' },
+        correlationId: 'c-1',
+        messageId: 'm-1',
+        userId: 'tasks',
+        expiration: '60000',
+      })
+
+      const [, , , options] = mockChannel.publish.mock.calls[0]
+      expect(options).toEqual({
+        persistent: true,
+        timestamp: 1757000000,
+        headers: { 'x-trace-id': 't-1' },
+        correlationId: 'c-1',
+        messageId: 'm-1',
+        userId: 'tasks',
+        expiration: '60000',
+      })
+    })
+
     it('should publish straight to a queue through the default exchange without declaring it', async () => {
       await client.publish('', 'orders.queue', { foo: 'bar' })
 
@@ -489,7 +511,7 @@ describe('RabbitMQClient', () => {
       const xDeath = [{ count: 1, reason: 'rejected', queue: 'queue', time: { '!': 'timestamp', value: 1757000000 } }]
       const msg = {
         ...createMessage({ foo: 'bar' }),
-        properties: { headers: { 'x-death': xDeath }, timestamp: 1757000000, messageId: 'm-1', correlationId: 'c-1' },
+        properties: { headers: { 'x-death': xDeath }, timestamp: 1757000000, messageId: 'm-1', correlationId: 'c-1', userId: 'tasks' },
       }
       deliver(msg)
       await vi.advanceTimersByTimeAsync(50)
@@ -500,6 +522,7 @@ describe('RabbitMQClient', () => {
         timestamp: 1757000000,
         messageId: 'm-1',
         correlationId: 'c-1',
+        userId: 'tasks',
       })
     })
 

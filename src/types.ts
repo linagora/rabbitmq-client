@@ -126,6 +126,13 @@ export interface PublishOptions {
   correlationId?: string
   /** Unique message identifier */
   messageId?: string
+  /**
+   * AMQP `user-id` property: the broker user this client connects as. RabbitMQ
+   * refuses the publish, closing the channel, when it names any other user, so
+   * set it only to the user of `url`. Consumers can then trust which user
+   * published the message.
+   */
+  userId?: string
   /** Per-message TTL in milliseconds (as string per AMQP spec) */
   expiration?: string
   /**
@@ -152,6 +159,12 @@ export interface RabbitMQMessageProperties {
   messageId?: string
   /** Correlation ID, if the publisher set one */
   correlationId?: string
+  /**
+   * AMQP `user-id`, if the publisher set one. RabbitMQ refuses a message whose
+   * `user-id` is not the user of the connection that published it, so it
+   * proves which broker user published the message.
+   */
+  userId?: string
 }
 
 /** Async handler function for consumed messages */
