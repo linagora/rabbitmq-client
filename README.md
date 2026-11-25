@@ -246,6 +246,12 @@ mockConnection.channel.simulateMessage({ userId: '123' })
 mockConnection.simulateClose()
 ```
 
+## Publishing
+
+Pushing a `v*` tag publishes the version of `package.json` to npm, with the `Publish package` workflow (`.github/workflows/publish.yml`).
+
+The workflow authenticates to npm with [trusted publishing](https://docs.npmjs.com/trusted-publishers) (OIDC): there is no npm token. Its `publish` job runs in the `npm` GitHub environment and publishes the `dist` folder built by the `build` job, without installing or building anything itself.
+
 ## License
 
 MIT

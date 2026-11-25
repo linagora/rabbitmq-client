@@ -7,26 +7,26 @@ on:
 
 permissions:
   contents: read
-  id-token: write
 
 jobs:
-  publish:
-    name: Publish Package to NPM
+  build:
+    name: Build and test
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '24'
           cache: 'npm'
-          registry-url: 'https://registry.npmjs.org'
 
       - name: Install dependencies
-        run: npm ci
+        run: npm ci --ignore-scripts
 
       - name: Run type check
         run: npm run typecheck
@@ -48,7 +48,45 @@ jobs:
           done
           echo "Build outputs verified"
 
+      # `dist` is the only generated entry of the `files` field of package.json:
+      # the publish job publishes it without building.
+      - name: Upload the built package
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist
+          path: dist
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish Package to NPM
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # The trusted publisher on npmjs.com names this environment.
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write # npm trusted publishing (OIDC)
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Trusted publishing needs npm 11.5.1 or later: Node.js 24 ships it
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+
+      - name: Download the built package
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist
+          path: dist
+
+      # No install and no script (`prepublishOnly` would build again): the job
+      # that can request the OIDC token only publishes what the build job made.
       - name: Publish to NPM
-        run: npm publish --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN_IN_VAULT }}
+        run: npm publish --ignore-scripts --access public
