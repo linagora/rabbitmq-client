@@ -284,6 +284,7 @@ export class RabbitMQClient {
             headers: options?.headers,
             correlationId: options?.correlationId,
             messageId: options?.messageId,
+            userId: options?.userId,
             expiration: options?.expiration,
             mandatory: options?.mandatory,
           })
@@ -721,6 +722,7 @@ export class RabbitMQClient {
       timestamp: message.properties.timestamp,
       messageId: message.properties.messageId,
       correlationId: message.properties.correlationId,
+      userId: message.properties.userId,
     }
 
     const maxRetries = options?.maxRetries ?? this.options.maxRetries
